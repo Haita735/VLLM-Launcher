@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>vLLM Launcher</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <h1>vLLM Launcher</h1>
+      <span class="subtitle" id="sys-subtitle">probing host…</span>
+      <span class="access-urls" id="access-urls"></span>
+    </div>
+    <div class="gpu-strip" id="gpu-strip"></div>
+    <div class="status-block">
+      <span class="pill" id="status-pill">idle</span>
+      <span class="endpoint" id="endpoint-label"></span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="launcher">Launcher</button>
+    <button class="tab" data-tab="download">Download</button>
+    <button class="tab" data-tab="chat">Chat</button>
+  </nav>
+
+  <div id="tab-launcher">
+  <main class="layout">
+    <section class="panel models-panel">
+      <div class="panel-head">
+        <h2>Models</h2>
+        <div class="head-actions">
+          <input type="search" id="model-filter" placeholder="Filter…" />
+          <label class="inline-check" title="Show models whose weights are not fully downloaded"><input type="checkbox" id="show-incomplete" /> incomplete</label>
+          <button class="ghost" id="rescan-btn" title="Rescan model roots">Rescan</button>
+        </div>
+      </div>
+      <div class="model-list" id="model-list"></div>
+    </section>
+
+    <section class="panel config-panel">
+      <div class="panel-head">
+        <h2>Launch configuration</h2>
+        <div class="head-actions">
+          <select id="preset-select"><option value="">Presets…</option></select>
+          <button class="ghost" id="preset-save">Save</button>
+          <button class="ghost danger" id="preset-delete">Delete</button>
+        </div>
+      </div>
+
+      <div class="config-body">
+        <div class="selected-model" id="selected-model">No model selected</div>
+        <div class="profile-bar">
+          <span id="profile-status">select a model</span>
+          <span class="profile-actions">
+            <button class="ghost" id="profile-save">Save for this model</button>
+            <button class="ghost danger" id="profile-reset">Reset</button>
+          </span>
+        </div>
+        <div class="notes" id="model-notes"></div>
+
+        <details open>
+          <summary>Server</summary>
+          <div class="grid">
+            <label>Host<input id="f-host" value="0.0.0.0" /></label>
+            <label>Port<input id="f-port" type="number" value="8000" /></label>
+            <label>Served name<input id="f-served_model_name" placeholder="auto" /></label>
+            <label>API key<input id="f-api_key" type="password" placeholder="none" autocomplete="new-password" /></label>
+          </div>
+        </details>
+
+        <details open>
+          <summary>Parallelism &amp; devices</summary>
+          <div class="grid">
+            <label>Visible GPUs<span class="gpu-picker" id="gpu-picker"></span></label>
+            <label>Tensor parallel<input id="f-tensor_parallel_size" type="number" min="1" placeholder="1" /></label>
+            <label>Pipeline parallel<input id="f-pipeline_parallel_size" type="number" min="1" placeholder="1" /></label>
+            <label>Executor
+              <select id="f-distributed_executor_backend">
+                <option value="">auto</option><option>mp</option><option>ray</option>
+                <option>uni</option><option>external_launcher</option>
+              </select>
+            </label>
+          </div>
+        </details>
+
+        <details open>
+          <summary>Precision &amp; kernels</summary>
+          <div class="grid">
+            <label>dtype
+              <select id="f-dtype">
+                <option value="">auto</option><option>float16</option><option>bfloat16</option>
+                <option>float32</option><option>half</option><option>float</option>
+              </select>
+            </label>
+            <label>Quantization<input id="f-quantization" list="quant-list" placeholder="from config" /></label>
+            <label>Linear backend
+              <select id="f-linear_backend">
+                <option value="">auto</option><option>marlin</option><option>cutlass</option>
+                <option>machete</option><option>exllama</option><option>triton</option>
+                <option>torch</option><option>emulation</option><option>flashinfer_cutlass</option>
+                <option>flashinfer_cutedsl</option><option>flashinfer_trtllm</option>
+                <option>flashinfer_cudnn</option><option>fbgemm</option><option>deep_gemm</option>
+                <option>humming</option><option>conch</option>
+              </select>
+            </label>
+            <label>Attention backend
+              <select id="f-attention_backend">
+                <option value="">auto</option><option>FLASH_ATTN</option><option>TRITON_ATTN</option>
+                <option>FLASHINFER</option><option>TORCH_SDPA</option><option>FLEX_ATTENTION</option>
+              </select>
+            </label>
+            <label>Mamba backend
+              <select id="f-mamba_backend">
+                <option value="">auto</option><option>TRITON</option><option>CUDA</option>
+              </select>
+            </label>
+            <label>Mamba cache dtype
+              <select id="f-mamba_cache_dtype">
+                <option value="">auto</option><option>float16</option>
+                <option>bfloat16</option><option>float32</option>
+              </select>
+            </label>
+          </div>
+        </details>
+
+        <details open>
+          <summary>Memory &amp; KV cache</summary>
+          <div class="grid">
+            <label>Max model len<input id="f-max_model_len" type="number" placeholder="from config" /></label>
+            <label>GPU memory util<input id="f-gpu_memory_utilization" type="number" step="0.01" min="0.05" max="1" placeholder="0.90" /></label>
+            <label>Max num seqs<input id="f-max_num_seqs" type="number" placeholder="auto" /></label>
+            <label>Max batched tokens<input id="f-max_num_batched_tokens" type="number" placeholder="auto" /></label>
+            <label>KV cache dtype
+              <select id="f-kv_cache_dtype">
+                <option value="">auto</option><option>fp8</option><option>fp8_e4m3</option>
+                <option>fp8_e5m2</option><option>float16</option><option>bfloat16</option>
+                <option>nvfp4</option>
+              </select>
+            </label>
+            <label>Block size
+              <select id="f-block_size">
+                <option value="">auto</option><option>8</option><option>16</option>
+                <option>32</option><option>64</option><option>128</option>
+              </select>
+            </label>
+            <label>Swap space (GiB)<input id="f-swap_space" type="number" step="0.5" placeholder="4" /></label>
+            <label>CPU offload (GiB)<input id="f-cpu_offload_gb" type="number" step="0.5" placeholder="0" /></label>
+          </div>
+        </details>
+
+        <details>
+          <summary>Behaviour</summary>
+          <div class="grid">
+            <label>Enforce eager<select id="f-enforce_eager" class="tri"></select></label>
+            <label>Chunked prefill<select id="f-enable_chunked_prefill" class="tri"></select></label>
+            <label>Prefix caching<select id="f-enable_prefix_caching" class="tri"></select></label>
+            <label>Trust remote code<select id="f-trust_remote_code" class="tri"></select></label>
+            <label>Auto tool choice<select id="f-enable_auto_tool_choice" class="tri"></select></label>
+            <label>Reasoning parser<input id="f-reasoning_parser" placeholder="e.g. qwen3" /></label>
+            <label>Tool call parser<input id="f-tool_call_parser" list="tool-list" placeholder="e.g. qwen3_xml" /></label>
+            <label>limit-mm-per-prompt<input id="f-limit_mm_per_prompt" placeholder='{"image":1}' /></label>
+          </div>
+          <label class="wide">Extra vLLM args
+            <textarea id="f-extra_args" rows="2" placeholder="--override-generation-config {&quot;temperature&quot;:0.7}"></textarea>
+          </label>
+          <label class="wide">Extra environment (KEY=VALUE per line)
+            <textarea id="f-env" rows="2" placeholder="VLLM_USE_V1=1"></textarea>
+          </label>
+        </details>
+
+        <div class="command-preview">
+          <div class="preview-head"><span>Command preview</span><button class="ghost" id="copy-cmd">Copy</button></div>
+          <code id="cmd-preview">select a model…</code>
+        </div>
+
+        <div class="actions">
+          <button class="primary" id="launch-btn" disabled>Load model</button>
+          <button class="danger" id="stop-btn" disabled>Unload</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <section class="panel terminal-panel">
+    <div class="panel-head">
+      <h2>Terminal</h2>
+      <div class="head-actions">
+        <label class="inline-check"><input type="checkbox" id="autoscroll" checked /> autoscroll</label>
+        <button class="ghost" id="clear-log">Clear</button>
+      </div>
+    </div>
+    <pre class="terminal" id="terminal">No runtime output yet.</pre>
+  </section>
+  </div>
+
+  <div id="tab-download" hidden>
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Download from Hugging Face</h2>
+        <div class="head-actions"><span id="dl-status" class="muted-text">idle</span></div>
+      </div>
+      <div class="config-body">
+        <label class="wide-plain">Model URL or repo id
+          <input id="dl-repo" placeholder="https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4  or  unsloth/Qwen3.8-27B-NVFP4" />
+        </label>
+        <div class="resolved" id="dl-resolved"></div>
+        <div class="grid">
+          <label>Revision<input id="dl-revision" placeholder="main" /></label>
+          <label>Include patterns (optional)<input id="dl-include" placeholder='*.safetensors *.json' /></label>
+        </div>
+        <div class="actions">
+          <button class="primary" id="dl-start">Download</button>
+          <button class="danger" id="dl-cancel" disabled>Cancel</button>
+        </div>
+        <p class="muted-text">Saved to the Hugging Face cache at <code>/mnt/vllmdata</code>. The model list refreshes automatically when the download completes.</p>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-top:14px">
+      <div class="panel-head">
+        <h2>Download log</h2>
+        <div class="head-actions"><button class="ghost" id="dl-clear">Clear</button></div>
+      </div>
+      <pre class="terminal" id="dl-terminal">No download output yet.</pre>
+    </section>
+  </div>
+
+  <div id="tab-chat" hidden>
+    <div class="chat-layout">
+      <section class="panel chat-main">
+        <div class="panel-head">
+          <h2>Chat</h2>
+          <div class="head-actions">
+            <span id="chat-model" class="muted-text">no model loaded</span>
+            <button class="ghost" id="chat-clear">Clear</button>
+          </div>
+        </div>
+        <div class="chat-messages" id="chat-messages"></div>
+        <div class="chat-input-row">
+          <textarea id="chat-input" rows="3" placeholder="Message the model...  (Enter to send, Shift+Enter for newline)"></textarea>
+          <div class="chat-buttons">
+            <button class="primary" id="chat-send">Send</button>
+            <button class="danger" id="chat-stop" disabled>Stop</button>
+            <button class="ghost" id="chat-regen">Regenerate</button>
+          </div>
+        </div>
+        <div class="chat-stats" id="chat-stats"></div>
+      </section>
+
+      <section class="panel chat-side">
+        <div class="panel-head"><h2>Parameters</h2></div>
+        <div class="config-body">
+          <label class="wide-plain">System prompt
+            <textarea id="chat-system" rows="4" placeholder="You are a helpful assistant."></textarea>
+          </label>
+          <div class="grid">
+            <label>Temperature<input id="chat-temperature" type="number" step="0.05" value="0.7" /></label>
+            <label>Top P<input id="chat-top_p" type="number" step="0.01" value="0.95" /></label>
+            <label>Top K<input id="chat-top_k" type="number" placeholder="off" /></label>
+            <label>Max tokens<input id="chat-max_tokens" type="number" value="2048" /></label>
+            <label>Presence penalty<input id="chat-presence_penalty" type="number" step="0.1" placeholder="0" /></label>
+            <label>Frequency penalty<input id="chat-frequency_penalty" type="number" step="0.1" placeholder="0" /></label>
+            <label>Repetition penalty<input id="chat-repetition_penalty" type="number" step="0.05" placeholder="1.0" /></label>
+            <label>Seed<input id="chat-seed" type="number" placeholder="random" /></label>
+          </div>
+          <label class="wide-plain">Stop sequences (one per line)
+            <textarea id="chat-stop-seq" rows="2" placeholder=""></textarea>
+          </label>
+          <label class="inline-check"><input type="checkbox" id="chat-stream" checked /> stream responses</label>
+          <label class="inline-check"><input type="checkbox" id="chat-thinking" checked /> enable thinking</label>
+          <label class="inline-check"><input type="checkbox" id="chat-show-reasoning" checked /> show reasoning</label>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <datalist id="quant-list">
+    <option>compressed-tensors</option><option>modelopt</option><option>modelopt_fp4</option>
+    <option>modelopt_mixed</option><option>fp8</option><option>awq</option><option>awq_marlin</option>
+    <option>gptq</option><option>gptq_marlin</option><option>bitsandbytes</option><option>mxfp4</option>
+  </datalist>
+  <datalist id="tool-list">
+    <option>qwen3_xml</option><option>qwen3_coder</option><option>hermes</option>
+    <option>llama3_json</option><option>mistral</option><option>pythonic</option><option>openai</option>
+  </datalist>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

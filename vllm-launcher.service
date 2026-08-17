@@ -1,0 +1,24 @@
+[Unit]
+Description=vLLM Launcher (LAN web UI)
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting, even after a rapid crash loop.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=andrew
+Group=andrew
+WorkingDirectory=/home/andrew/vllm-launcher
+Environment="PYTHONUNBUFFERED=1"
+Environment="HF_HOME=/mnt/vllmdata"
+Environment="VLLM_BIN=/home/andrew/miniconda3/envs/vllm/bin/vllm"
+Environment="VLLM_LAUNCHER_HOST=0.0.0.0"
+Environment="VLLM_LAUNCHER_PORT=7870"
+Environment="VLLM_LAUNCHER_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,::1/128,fc00::/7,fe80::/10"
+ExecStart=/home/andrew/miniconda3/envs/vllm/bin/python /home/andrew/vllm-launcher/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

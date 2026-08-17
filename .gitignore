@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime state - these hold local paths and may contain API keys
+presets/
+profiles/
+
+# Logs / scratch
+*.log
+nohup.out
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
