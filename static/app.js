@@ -20,6 +20,10 @@ const TEXT_FIELDS = [
   'enable_auto_tool_choice',
 ];
 
+// How many log lines the browser keeps and renders. The server's ring buffer
+// is larger, but a new SSE connection only replays this many lines.
+const LOG_LINE_CAP = 1000;
+
 const state = {
   models: [],
   selected: null,
@@ -335,11 +339,36 @@ async function pollStatus() {
 }
 
 function appendLog(event) {
-  if (state.logSeen.has(event.sequence)) return;
-  state.logSeen.add(event.sequence);
-  state.logLines.push(event);
-  if (state.logLines.length > 4000) state.logLines.splice(0, state.logLines.length - 4000);
-  renderLogs();
+  appendLogs([event]);
+}
+
+// Coalesce redraws into one per animation frame: a backlog replay arrives
+// across several network chunks, and rebuilding innerHTML per chunk would
+// still stutter the page.
+let logRenderQueued = false;
+function scheduleLogRender() {
+  if (logRenderQueued) return;
+  logRenderQueued = true;
+  requestAnimationFrame(() => {
+    logRenderQueued = false;
+    renderLogs();
+  });
+}
+
+// Apply a batch of events; the actual redraw is coalesced via scheduleLogRender.
+// The server replays a capped backlog on connect — rebuilding the terminal's
+// innerHTML once per line (the original code) froze the page on load.
+function appendLogs(events) {
+  let grew = false;
+  for (const event of events) {
+    if (state.logSeen.has(event.sequence)) continue;
+    state.logSeen.add(event.sequence);
+    state.logLines.push(event);
+    grew = true;
+  }
+  if (!grew) return;
+  if (state.logLines.length > LOG_LINE_CAP) state.logLines.splice(0, state.logLines.length - LOG_LINE_CAP);
+  scheduleLogRender();
 }
 
 function classify(line) {
@@ -376,10 +405,12 @@ async function streamLogs() {
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
+      const batch = [];
       lines.forEach((line) => {
         if (!line.startsWith('data: ')) return;
-        try { appendLog(JSON.parse(line.slice(6))); } catch (_) { /* partial frame */ }
+        try { batch.push(JSON.parse(line.slice(6))); } catch (_) { /* partial frame */ }
       });
+      if (batch.length) appendLogs(batch);
     }
   } catch (err) {
     if (err.name !== 'AbortError') setTimeout(streamLogs, 3000);
@@ -426,6 +457,16 @@ function setDownloadStatus(status) {
   $('dl-cancel').disabled = !status.running;
 }
 
+let dlRenderQueued = false;
+function scheduleDlRender() {
+  if (dlRenderQueued) return;
+  dlRenderQueued = true;
+  requestAnimationFrame(() => {
+    dlRenderQueued = false;
+    renderDownloadLogs();
+  });
+}
+
 function renderDownloadLogs() {
   const term = $('dl-terminal');
   if (!state.dlLines.length) { term.textContent = 'No download output yet.'; return; }
@@ -456,9 +497,15 @@ async function streamDownloadLogs() {
           if (state.dlSeen.has(event.sequence)) return;
           state.dlSeen.add(event.sequence);
           state.dlLines.push(event);
-          renderDownloadLogs();
         } catch (_) { /* partial frame */ }
       });
+      // Coalesce into one render per frame: huggingface-cli is chatty and the
+      // buffer replay on reconnect is even chattier — per-line rebuilds froze
+      // the page, and one render per animation frame is the safe floor.
+      if (state.dlLines.length) {
+        if (state.dlLines.length > LOG_LINE_CAP) state.dlLines.splice(0, state.dlLines.length - LOG_LINE_CAP);
+        scheduleDlRender();
+      }
     }
   } catch (_) { /* reconnect below */ }
   setTimeout(streamDownloadLogs, 2000);
@@ -705,7 +752,7 @@ function init() {
     try { setDownloadStatus(await api('/api/download/cancel', { method: 'POST' })); }
     catch (err) { alert(err.message); }
   });
-  $('dl-clear').addEventListener('click', () => { state.dlLines = []; renderDownloadLogs(); });
+  $('dl-clear').addEventListener('click', () => { state.dlLines = []; scheduleDlRender(); });
 
   $('chat-send').addEventListener('click', () => sendChat());
   $('chat-stop').addEventListener('click', () => state.chatAbort?.abort());
@@ -725,7 +772,7 @@ function init() {
   $('model-filter').addEventListener('input', renderModels);
   $('show-incomplete').addEventListener('change', () => loadModels(false));
   $('rescan-btn').addEventListener('click', () => loadModels(true));
-  $('clear-log').addEventListener('click', () => { state.logLines = []; renderLogs(); });
+  $('clear-log').addEventListener('click', () => { state.logLines = []; scheduleLogRender(); });
   $('copy-cmd').addEventListener('click', () => navigator.clipboard?.writeText($('cmd-preview').textContent));
 
   $('launch-btn').addEventListener('click', async () => {

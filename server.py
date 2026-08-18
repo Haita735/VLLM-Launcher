@@ -66,6 +66,12 @@ MODEL_ROOTS = [
 ]
 
 LOG_BUFFER = int(os.environ.get("VLLM_LAUNCHER_LOG_LINES", "4000"))
+# How many of the most recent log lines to hand to a newly connected SSE
+# client (and how many the browser renders). The full buffer stays available
+# at /api/logs for debugging.
+LOG_STREAM_REPLAY = min(
+    LOG_BUFFER, int(os.environ.get("VLLM_LAUNCHER_STREAM_REPLAY", "1000"))
+)
 PRESET_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 # Networks allowed to reach the UI. Tailscale's 100.64.0.0/10 is not covered by
@@ -672,21 +678,21 @@ class EventLog:
             return list(self.events)
 
     def stream(self) -> Iterator[str]:
-        last = 0
+        with self.lock:
+            last = max(0, self.sequence - LOG_STREAM_REPLAY)
         while True:
             with self.condition:
                 pending = [e for e in self.events if e["sequence"] > last]
                 if not pending:
                     self.condition.wait(timeout=10)
                     pending = [e for e in self.events if e["sequence"] > last]
-                if pending:
-                    payloads = []
-                    for event in pending:
-                        last = event["sequence"]
-                        payloads.append(f"data: {json.dumps(event)}\n\n")
-                else:
-                    payloads = [": heartbeat\n\n"]
-            yield from payloads
+                for event in pending:
+                    last = event["sequence"]
+            if pending:
+                for event in pending:
+                    yield f"data: {json.dumps(event)}\n\n"
+            else:
+                yield ": heartbeat\n\n"
 
 
 @dataclass
@@ -717,21 +723,26 @@ class Runtime:
             self._append_locked(line)
 
     def stream(self) -> Iterator[str]:
-        last = 0
+        # Replay at most the last LOG_STREAM_REPLAY lines: sending the full
+        # ring buffer made the page stall on open, and the client only
+        # renders the most recent lines anyway.
+        with self.lock:
+            last = max(0, self.sequence - LOG_STREAM_REPLAY)
         while True:
             with self.condition:
                 pending = [e for e in self.events if e["sequence"] > last]
                 if not pending:
                     self.condition.wait(timeout=10)
                     pending = [e for e in self.events if e["sequence"] > last]
-                if pending:
-                    payloads = []
-                    for event in pending:
-                        last = event["sequence"]
-                        payloads.append(f"data: {json.dumps(event)}\n\n")
-                else:
-                    payloads = [": heartbeat\n\n"]
-            yield from payloads
+                for event in pending:
+                    last = event["sequence"]
+            # Serialize outside the lock — json.dumps on a big replay burst
+            # would otherwise stall _pump() and stop() for its duration.
+            if pending:
+                for event in pending:
+                    yield f"data: {json.dumps(event)}\n\n"
+            else:
+                yield ": heartbeat\n\n"
 
     # -- lifecycle ----------------------------------------------------------------
     def start(self, spec: LaunchSpec) -> dict:
