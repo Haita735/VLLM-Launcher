@@ -448,8 +448,8 @@ def compatibility_notes(entry: dict) -> list[dict]:
         notes.append(
             {
                 "level": "warn",
-                "text": "Checkpoint ships fp8 KV scales, but fp8 KV cache needs SM89+. "
-                "Leave kv-cache-dtype on auto.",
+                "text": "Checkpoint ships fp8 KV scales, so kv-cache-dtype=auto resolves to fp8, "
+                "which needs SM89+. Set kv-cache-dtype=float16 explicitly.",
             }
         )
     if entry.get("multimodal"):

@@ -182,8 +182,9 @@ cards, just through different kernels. Verified on **sm_75 (TITAN RTX)** with vL
   `linear-backend = marlin`.
 - **FP8 works** the same way (`Fp8Config.get_min_capability()` returns `75`).
 - **bfloat16 does not.** Set `dtype = float16`; vLLM logs `Casting torch.bfloat16 to torch.float16`.
-- **FP8 KV cache does not** — needs sm_89+. Leave `kv-cache-dtype` on `auto` even when the
-  checkpoint ships fp8 KV scales.
+- **FP8 KV cache does not** — needs sm_89+. Set `kv-cache-dtype = float16` explicitly: when the
+  checkpoint ships fp8 KV scales (`kv_cache_scheme` in `config.json`), `auto` resolves to fp8 and
+  `TRITON_ATTN` aborts with `native FP8 (fp8e4nv) requires SM89+`.
 - **FlashAttention 2 needs sm_80+**, so attention auto-selects `TRITON_ATTN`. This is fine.
 - **Gated DeltaNet / hybrid linear-attention models** (Qwen3.5/3.6/3.8) compile and run — the
   Triton kernels JIT to cubins for sm_75.
