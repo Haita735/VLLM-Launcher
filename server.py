@@ -12,6 +12,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -28,19 +29,38 @@ from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
+TEMPLATE_DIR = Path(os.environ.get("VLLM_LAUNCHER_TEMPLATES", APP_DIR / "templates"))
 PRESET_DIR = Path(os.environ.get("VLLM_LAUNCHER_PRESETS", APP_DIR / "presets"))
 PRESET_DIR.mkdir(parents=True, exist_ok=True)
 PROFILE_DIR = Path(os.environ.get("VLLM_LAUNCHER_PROFILES", APP_DIR / "profiles"))
 PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-VLLM_BIN = Path(os.environ.get("VLLM_BIN", "/home/andrew/miniconda3/envs/vllm/bin/vllm"))
+
+def _default_vllm_bin() -> str:
+    """The launcher is normally started by the same environment that has vLLM, so
+    prefer the executable sitting next to the interpreter running this file."""
+    sibling = Path(sys.executable).with_name("vllm")
+    if sibling.exists():
+        return str(sibling)
+    return shutil.which("vllm") or "vllm"
+
+
+VLLM_BIN = Path(os.environ.get("VLLM_BIN") or _default_vllm_bin())
+
+# Hugging Face's own default location when HF_HOME is not set.
+HF_HOME = os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+
+# A vLLM on this port may be owned by another manager (the InspireAI runtime agent). The
+# launcher adopts it read-only rather than competing for the GPUs.
+EXTERNAL_PORT = int(os.environ.get("VLLM_LAUNCHER_EXTERNAL_PORT", "8000"))
+EXTERNAL_API_KEY = os.environ.get("VLLM_LAUNCHER_EXTERNAL_API_KEY") or None
 
 # Directories scanned for models. HF-cache layouts and plain checkpoint dirs are both handled.
 MODEL_ROOTS = [
     Path(p).expanduser()
     for p in os.environ.get(
         "VLLM_LAUNCHER_MODEL_ROOTS",
-        "/mnt/vllmdata/hub:~/.cache/huggingface/hub:~/models",
+        f"{HF_HOME}/hub:~/models",
     ).split(":")
     if p.strip()
 ]
@@ -190,6 +210,8 @@ def system_info() -> dict:
             "capability": f"{cap_major_minor[0]}.{cap_major_minor[1]}" if caps else None,
             "capability_int": cap_major_minor[0] * 10 + cap_major_minor[1],
             "gpu_count": len(gpus),
+            "external_port": EXTERNAL_PORT,
+            "hf_home": HF_HOME,
             "access_urls": [
                 f"http://{addr}:{os.environ.get('VLLM_LAUNCHER_PORT', '7870')}"
                 for addr in _local_addresses()
@@ -553,6 +575,11 @@ def _validate_model(spec: LaunchSpec) -> str:
 def build_command(spec: LaunchSpec) -> tuple[list[str], dict[str, str]]:
     model_path = _validate_model(spec)
 
+    # vLLM advertises whatever path it was handed as the model id. Resolving a repo id to an
+    # on-disk snapshot would therefore rename the model for every client, so pin the repo id.
+    if not spec.served_model_name and model_path != spec.model:
+        spec = spec.model_copy(update={"served_model_name": spec.model})
+
     if not 1 <= spec.port <= 65535:
         raise HTTPException(status_code=400, detail="Port must be between 1 and 65535")
     if spec.gpu_memory_utilization is not None and not 0.05 <= spec.gpu_memory_utilization <= 1.0:
@@ -580,15 +607,32 @@ def build_command(spec: LaunchSpec) -> tuple[list[str], dict[str, str]]:
             raise HTTPException(status_code=400, detail=f"Could not parse extra args: {exc}") from exc
         if extra and not extra[0].startswith("-"):
             raise HTTPException(status_code=400, detail="Extra args must start with a flag")
+        # Keep saved profiles portable across machines: a bare template name resolves
+        # against this install's templates dir instead of the path it was saved with.
+        for index, token in enumerate(extra[:-1]):
+            if token == "--chat-template":
+                template = Path(extra[index + 1]).expanduser()
+                if not template.is_absolute():
+                    template = TEMPLATE_DIR / template.name
+                extra[index + 1] = str(template)
         argv += extra
 
     env = os.environ.copy()
-    env.setdefault("HF_HOME", "/mnt/vllmdata")
+    env.setdefault("HF_HOME", HF_HOME)
     env.setdefault("HF_HUB_OFFLINE", "1")
     # vLLM 0.26 pins flashinfer-python==0.6.14 but flashinfer-cubin has no 0.6.14 release.
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     env["PYTHONUNBUFFERED"] = "1"
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    # Under systemd PATH is minimal, but FlashInfer shells out to ninja (and nvcc) to JIT
+    # kernels, so put the vLLM env and CUDA toolchain in front of it.
+    search_path = [str(VLLM_BIN.parent)]
+    cuda_root = env.get("CUDA_HOME") or env.get("CUDA_PATH")
+    if cuda_root and (Path(cuda_root) / "bin" / "nvcc").exists():
+        search_path.append(str(Path(cuda_root) / "bin"))
+    if env.get("PATH"):
+        search_path.append(env["PATH"])
+    env["PATH"] = os.pathsep.join(search_path)
     if spec.gpu_indices:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in sorted(set(spec.gpu_indices)))
     for key, value in spec.env.items():
@@ -655,6 +699,7 @@ class Runtime:
     spec: LaunchSpec | None = None
     command: list[str] = field(default_factory=list)
     started_at: float | None = None
+    adopted: bool = False
 
     def __post_init__(self):
         self.condition = threading.Condition(self.lock)
@@ -691,9 +736,22 @@ class Runtime:
     # -- lifecycle ----------------------------------------------------------------
     def start(self, spec: LaunchSpec) -> dict:
         argv, env = build_command(spec)
+        # Probed before locking: another manager may already own this port, and the GPUs
+        # cannot hold a second copy of a model even if the bind were to succeed.
+        foreign = self._probe(spec.port, spec.api_key or EXTERNAL_API_KEY)
+        if foreign["online"]:
+            serving = ", ".join(foreign["models"]) or "an unknown model"
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Port {spec.port} is already serving {serving} from a process this launcher "
+                    "does not own. Stop it where it was started (InspireAI admin UI) first."
+                ),
+            )
         with self.lock:
             if self.process and self.process.poll() is None:
                 raise HTTPException(status_code=409, detail="A vLLM process is already running")
+            self.adopted = False
             self.events.clear()
             self.sequence = 0
             self._append_locked(f"$ {shlex.join(argv)}")
@@ -736,10 +794,19 @@ class Runtime:
     def stop(self) -> dict:
         with self.lock:
             process = self.process
-            if not process or process.poll() is not None:
-                self._append_locked("No vLLM process is running.")
-                return self._status_locked()
-            self._append_locked(f"Stopping vLLM pid={process.pid} (SIGTERM)...")
+            owned = bool(process and process.poll() is None)
+            if owned:
+                self._append_locked(f"Stopping vLLM pid={process.pid} (SIGTERM)...")
+        if not owned:
+            current = self.status()
+            if current.get("external"):
+                self.log(
+                    f"The vLLM on port {current['port']} was started outside this launcher; "
+                    "stop it from the InspireAI admin UI."
+                )
+            else:
+                self.log("No vLLM process is running.")
+            return current
         try:
             os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             process.wait(timeout=30)
@@ -773,7 +840,44 @@ class Runtime:
             snapshot = self._status_locked()
             port = self.spec.port if self.spec else None
             key = self.spec.api_key if self.spec else None
-        snapshot["endpoint"] = self._probe(port, key) if port else {"online": False}
+
+        if snapshot["running"]:
+            snapshot["endpoint"] = self._probe(port, key) if port else {"online": False}
+            snapshot["owned"] = True
+            snapshot["external"] = False
+            return snapshot
+
+        # Nothing of ours is up, so adopt whatever else is serving the shared port. This keeps
+        # the status pill, chat proxy and delete guard honest about a model the InspireAI
+        # runtime agent launched.
+        endpoint = self._probe(EXTERNAL_PORT, EXTERNAL_API_KEY)
+        snapshot["endpoint"] = endpoint
+        snapshot["owned"] = False
+        snapshot["external"] = endpoint["online"]
+        if endpoint["online"]:
+            snapshot.update(
+                {
+                    "running": True,
+                    "pid": None,
+                    "returncode": None,
+                    "uptime": None,
+                    "port": EXTERNAL_PORT,
+                    "model": (endpoint["models"] or [None])[0],
+                    "command": [],
+                }
+            )
+
+        with self.lock:
+            if endpoint["online"] and not self.adopted:
+                self.adopted = True
+                self._append_locked(
+                    f"Adopted an external vLLM on port {EXTERNAL_PORT} serving "
+                    f"{', '.join(endpoint['models']) or 'an unknown model'}. It was started "
+                    "outside this launcher, so no log output is available here and Stop is "
+                    "disabled. Manage it from the InspireAI admin UI."
+                )
+            elif not endpoint["online"]:
+                self.adopted = False
         return snapshot
 
     @staticmethod
@@ -852,7 +956,7 @@ class Downloader:
                     argv += ["--include", pattern]
 
             env = os.environ.copy()
-            env.setdefault("HF_HOME", "/mnt/vllmdata")
+            env.setdefault("HF_HOME", HF_HOME)
             env["HF_HUB_OFFLINE"] = "0"  # the launcher defaults to offline; downloads need the network
             env["PYTHONUNBUFFERED"] = "1"
 
@@ -1017,8 +1121,9 @@ def api_chat(req: ChatRequest):
         payload["stream_options"] = {"include_usage": True}
 
     with runtime.lock:
-        port = runtime.spec.port if runtime.spec else None
-        api_key = runtime.spec.api_key if runtime.spec else None
+        owned_key = runtime.spec.api_key if runtime.spec else None
+    port = status["port"]
+    api_key = owned_key if status.get("owned") else EXTERNAL_API_KEY
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
 
@@ -1092,13 +1197,20 @@ def api_delete_models(body: dict):
     known = {entry["id"]: entry for entry in discover_models()}
     roots = [root.resolve() for root in MODEL_ROOTS if root.is_dir()]
     active = runtime.status()
+    # Covers both a model we launched and one adopted from another manager, which reports
+    # itself by served name rather than by the id discovery assigned it.
+    loaded = set()
+    if active["running"]:
+        loaded.add(active.get("model"))
+        loaded.update(active.get("endpoint", {}).get("models") or [])
+    loaded.discard(None)
     deleted, freed = [], 0
 
     for model_id in requested:
         entry = known.get(model_id)
         if entry is None:
             raise HTTPException(status_code=404, detail=f"Unknown model: {model_id}")
-        if active["running"] and active["model"] == model_id:
+        if model_id in loaded or entry["path"] in loaded:
             raise HTTPException(
                 status_code=409, detail=f"{model_id} is currently loaded. Unload it first."
             )

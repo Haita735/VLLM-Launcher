@@ -52,9 +52,8 @@ No build step, no npm, no framework. The frontend is three static files.
 git clone https://github.com/animeclips0904-a11y/VLLM-Launcher.git ~/vllm-launcher
 cd ~/vllm-launcher
 
-# point it at the python env that has vLLM installed
-VLLM_BIN=/path/to/envs/vllm/bin/vllm \
-HF_HOME=/mnt/vllmdata \
+# run it with the python from the env that has vLLM installed - everything else
+# (vllm binary, HF cache, model roots) is derived from that unless you override it
 /path/to/envs/vllm/bin/python server.py
 ```
 
@@ -85,14 +84,37 @@ All optional; sensible defaults in brackets.
 |---|---|---|
 | `VLLM_LAUNCHER_HOST` | `0.0.0.0` | bind address |
 | `VLLM_LAUNCHER_PORT` | `7870` | bind port |
-| `VLLM_BIN` | `/home/andrew/miniconda3/envs/vllm/bin/vllm` | path to the `vllm` executable |
-| `VLLM_LAUNCHER_MODEL_ROOTS` | `/mnt/vllmdata/hub:~/.cache/huggingface/hub:~/models` | `:`-separated scan paths |
+| `VLLM_BIN` | the `vllm` next to the running interpreter, else `$PATH` | path to the `vllm` executable |
+| `VLLM_LAUNCHER_MODEL_ROOTS` | `$HF_HOME/hub:~/models` | `:`-separated scan paths |
+| `VLLM_LAUNCHER_TEMPLATES` | `./templates` | chat templates resolved by bare name |
 | `VLLM_LAUNCHER_PROFILES` | `./profiles` | per-model saved configs |
 | `VLLM_LAUNCHER_PRESETS` | `./presets` | named presets |
 | `VLLM_LAUNCHER_LOG_LINES` | `4000` | log ring buffer size |
+| `VLLM_LAUNCHER_EXTERNAL_PORT` | `8000` | port to adopt an externally started vLLM from |
+| `VLLM_LAUNCHER_EXTERNAL_API_KEY` | unset | key for that external endpoint, if it needs one |
 | `VLLM_LAUNCHER_ALLOWED_CIDRS` | RFC1918 + loopback + link-local + `100.64.0.0/10` | who may connect |
 | `VLLM_LAUNCHER_ALLOW_ANY` | unset | set to `1` to disable the network allowlist |
-| `HF_HOME` | `/mnt/vllmdata` | Hugging Face cache root |
+| `HF_HOME` | `~/.cache/huggingface` | Hugging Face cache root |
+
+Nothing is hardcoded to a particular machine: with no environment set at all, the launcher
+uses the `vllm` beside the Python running it and Hugging Face's own default cache location.
+
+### Chat templates
+
+Drop `.jinja` files in `templates/` and reference them with `--chat-template <name>.jinja` in
+extra args. Bare names resolve against that directory, so a saved profile stays valid on a
+different machine; absolute paths are passed through untouched.
+
+`templates/qwen38-effort-tolerant.jinja` is Qwen3.8's stock template with one change: an
+unrecognised `reasoning_effort` falls back to the default instead of `raise_exception`, which
+otherwise turns any client sending `minimal`/`none` into a 400. It also accepts
+`thinking_effort` as an alias.
+
+### Sharing a GPU with another manager
+
+If something else already serves on `VLLM_LAUNCHER_EXTERNAL_PORT`, the launcher adopts it
+read-only: status, chat and the delete guard all see that model, Launch refuses with a 409
+instead of fighting for the GPUs, and Stop is disabled because the process is not its child.
 
 Model roots handle both layouts: Hugging Face caches (`models--org--name/snapshots/<rev>/`) and
 plain directories containing a `config.json` or `*.gguf`.
@@ -259,6 +281,7 @@ server.py               FastAPI backend: discovery, launch, downloads, chat prox
 static/index.html       markup for all three tabs
 static/app.js           client logic, no dependencies
 static/styles.css       dark theme
+templates/              chat templates, referenced by bare name from extra args
 vllm-launcher.service   systemd unit
 profiles/               per-model saved configs   (gitignored)
 presets/                named presets             (gitignored)

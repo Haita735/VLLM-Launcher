@@ -83,6 +83,7 @@ async function loadSystem() {
     `vLLM ${v.vllm || '?'} · torch ${v.torch || '?'} · CUDA ${v.cuda || '?'} · sm_${(sys.capability || '').replace('.', '') || '?'}`;
   renderGpus(sys.gpus || []);
   renderGpuPicker(sys.gpus || []);
+  $('dl-hf-home').textContent = sys.hf_home || '(unset)';
   $('access-urls').innerHTML = (sys.access_urls || [])
     .map((url) => `<a href="${url}" class="url-chip">${url.replace('http://', '')}</a>`).join('');
 }
@@ -304,19 +305,27 @@ function setStatus(status) {
   state.running = status.running;
   const pill = $('status-pill');
   const online = status.endpoint?.online;
+  const external = !!status.external;
   pill.className = 'pill';
-  if (status.running && online) { pill.classList.add('running'); pill.textContent = 'serving'; }
+  if (status.running && online) {
+    pill.classList.add('running');
+    pill.textContent = external ? 'serving · external' : 'serving';
+  }
   else if (status.running) { pill.classList.add('starting'); pill.textContent = 'loading'; }
   else if (status.returncode) { pill.classList.add('error'); pill.textContent = `exit ${status.returncode}`; }
   else { pill.textContent = 'idle'; }
 
+  const owner = external ? 'not owned by launcher' : `pid ${status.pid}`;
   $('endpoint-label').textContent = status.running
-    ? `pid ${status.pid} · :${status.port}${online ? ` · ${status.endpoint.models.join(', ')}` : ''}`
+    ? `${owner} · :${status.port}${online ? ` · ${status.endpoint.models.join(', ')}` : ''}`
     : '';
   $('launch-btn').disabled = status.running
     || !state.selected
     || state.selected.download?.state === 'missing';
-  $('stop-btn').disabled = !status.running;
+  $('stop-btn').disabled = !status.running || external;
+  $('stop-btn').title = external
+    ? 'Started outside this launcher — stop it from the InspireAI admin UI.'
+    : '';
   const models = status.endpoint?.models || [];
   $('chat-model').textContent = status.running ? (models[0] || 'model loading…') : 'no model loaded';
 }

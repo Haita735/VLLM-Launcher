@@ -7,16 +7,28 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=andrew
-Group=andrew
-WorkingDirectory=/home/andrew/vllm-launcher
+# Absolute paths are unavoidable in a systemd unit - edit these four for your box.
+User=CHANGEME_USER
+Group=CHANGEME_USER
+WorkingDirectory=/path/to/VLLM-Launcher
+ExecStart=/path/to/envs/vllm/bin/python /path/to/VLLM-Launcher/server.py
+
+# Optional per-machine overrides, kept out of git. Leading '-' means "skip if absent".
+EnvironmentFile=-/etc/vllm-launcher.env
+
 Environment="PYTHONUNBUFFERED=1"
-Environment="HF_HOME=/mnt/vllmdata"
-Environment="VLLM_BIN=/home/andrew/miniconda3/envs/vllm/bin/vllm"
+Environment="HF_HUB_OFFLINE=1"
 Environment="VLLM_LAUNCHER_HOST=0.0.0.0"
 Environment="VLLM_LAUNCHER_PORT=7870"
+# Everything below is optional; server.py derives sensible defaults when unset.
+#   VLLM_BIN                    defaults to the vllm next to this interpreter
+#   HF_HOME                     defaults to ~/.cache/huggingface
+#   VLLM_LAUNCHER_MODEL_ROOTS   defaults to $HF_HOME/hub:~/models
+#   VLLM_LAUNCHER_EXTERNAL_PORT port to adopt a foreign vLLM from (default 8000)
+# CUDA_HOME is only needed if nvcc lives somewhere non-standard; the launcher puts
+# $VLLM_BIN's directory and $CUDA_HOME/bin on PATH so FlashInfer can JIT with ninja.
+#Environment="CUDA_HOME=/usr/local/cuda"
 Environment="VLLM_LAUNCHER_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,::1/128,fc00::/7,fe80::/10"
-ExecStart=/home/andrew/miniconda3/envs/vllm/bin/python /home/andrew/vllm-launcher/server.py
 Restart=always
 RestartSec=5
 
