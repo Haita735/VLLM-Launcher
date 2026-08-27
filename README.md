@@ -4,7 +4,7 @@ A LAN-only web UI for running [vLLM](https://github.com/vllm-project/vllm) on yo
 Browse the models you've downloaded, tune the launch flags, start/stop the server, watch the
 live log, pull new models from Hugging Face, and talk to whatever is loaded — all from one page.
 
-Built for a homelab box with two NVIDIA TITAN RTX cards, but nothing is hardcoded to that setup.
+Built for a homelab box running nvidia gpus.
 
 Dark theme, three tabs — **Launcher**, **Download**, **Chat** — no build step, no dependencies
 beyond what a vLLM environment already has.
@@ -49,7 +49,7 @@ No build step, no npm, no framework. The frontend is three static files.
 ## Quick start
 
 ```bash
-git clone https://github.com/animeclips0904-a11y/VLLM-Launcher.git ~/vllm-launcher
+git clone https://github.com/Haita735/VLLM-Launcher.git ~/vllm-launcher
 cd ~/vllm-launcher
 
 # run it with the python from the env that has vLLM installed - everything else
