@@ -66,10 +66,14 @@ body {
   padding: 6px 10px;
   min-width: 190px;
 }
-.gpu-card .gpu-name { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; }
+.gpu-card .gpu-name { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between; gap: 10px; }
 .gpu-card .bar { height: 5px; background: #1e293b; border-radius: 3px; margin: 5px 0 3px; overflow: hidden; }
 .gpu-card .bar span { display: block; height: 100%; background: linear-gradient(90deg, var(--primary), #a78bfa); }
 .gpu-card .gpu-meta { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+.ram-card .bar span { background: linear-gradient(90deg, #34d399, #fbbf24); }
+.ram-card.low { border-color: rgba(248, 113, 113, 0.6); }
+.ram-card.low .gpu-name span:last-child { color: var(--danger); font-weight: 600; }
+#engine-hint.bad { color: var(--danger); }
 
 .status-block { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .pill {

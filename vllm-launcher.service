@@ -21,14 +21,28 @@ Environment="HF_HUB_OFFLINE=1"
 Environment="VLLM_LAUNCHER_HOST=0.0.0.0"
 Environment="VLLM_LAUNCHER_PORT=7870"
 # Everything below is optional; server.py derives sensible defaults when unset.
-#   VLLM_BIN                    defaults to the vllm next to this interpreter
-#   HF_HOME                     defaults to ~/.cache/huggingface
-#   VLLM_LAUNCHER_MODEL_ROOTS   defaults to $HF_HOME/hub:~/models
-#   VLLM_LAUNCHER_EXTERNAL_PORT port to adopt a foreign vLLM from (default 8000)
-# CUDA_HOME is only needed if nvcc lives somewhere non-standard; the launcher puts
-# $VLLM_BIN's directory and $CUDA_HOME/bin on PATH so FlashInfer can JIT with ninja.
+#   VLLM_PYTHON / SGLANG_PYTHON  interpreter of the env that has the engine (auto-discovered:
+#                                the interpreter above, sibling conda envs, common venv paths)
+#   VLLM_BIN / SGLANG_BIN        alternative: path to the engine's executable
+#   HF_HOME                      defaults to ~/.cache/huggingface
+#   VLLM_LAUNCHER_MODEL_ROOTS    defaults to $HF_HOME/hub:~/models
+#   VLLM_LAUNCHER_EXTERNAL_PORT  port to adopt a foreign OpenAI-compatible server from (8000)
+#   VLLM_LAUNCHER_MIN_FREE_RAM_GIB / _RAM_KILL_GIB / _RAM_PSI_FULL / _JIT_MAX_JOBS
+#                                host-RAM guard thresholds (README: "Host RAM guards")
+# CUDA_HOME / LD_LIBRARY_PATH are derived per launch from the *selected* engine's env (its
+# pip-installed nvidia/cu13 toolkit); values set here that point into a different engine's
+# env are dropped for that launch, so a single EnvironmentFile is safe for both engines.
 #Environment="CUDA_HOME=/usr/local/cuda"
 Environment="VLLM_LAUNCHER_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,100.64.0.0/10,::1/128,fc00::/7,fe80::/10"
+
+# Hard host-RAM ceiling enforced by the kernel for the launcher AND every engine it spawns
+# (children inherit the cgroup). The launcher's own watchdog is the first line of defence;
+# this is the backstop for when the box is already too thrashed to run it. Size it to leave
+# the desktop about half the machine (16G/13G on a 30 GiB box); capping at nearly all of RAM
+# still starves everything outside the cgroup.
+#MemoryHigh=13G
+#MemoryMax=16G
+#MemorySwapMax=2G
 Restart=always
 RestartSec=5
 

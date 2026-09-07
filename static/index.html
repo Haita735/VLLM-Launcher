@@ -65,11 +65,18 @@
         <details open>
           <summary>Server</summary>
           <div class="grid">
+            <label>Engine
+              <select id="f-engine">
+                <option value="vllm">vLLM</option>
+                <option value="sglang">SGLang</option>
+              </select>
+            </label>
             <label>Host<input id="f-host" value="0.0.0.0" /></label>
             <label>Port<input id="f-port" type="number" value="8000" /></label>
             <label>Served name<input id="f-served_model_name" placeholder="auto" /></label>
             <label>API key<input id="f-api_key" type="password" placeholder="none" autocomplete="new-password" /></label>
           </div>
+          <p class="muted-text" id="engine-hint"></p>
         </details>
 
         <details open>
@@ -164,18 +171,103 @@
             <label>Tool call parser<input id="f-tool_call_parser" list="tool-list" placeholder="e.g. qwen3_xml" /></label>
             <label>limit-mm-per-prompt<input id="f-limit_mm_per_prompt" placeholder='{"image":1}' /></label>
           </div>
-          <label class="wide">Extra vLLM args
-            <textarea id="f-extra_args" rows="2" placeholder="--override-generation-config {&quot;temperature&quot;:0.7}"></textarea>
+          <label class="wide">Extra engine args (passed through verbatim)
+            <textarea id="f-extra_args" rows="2" placeholder="vLLM: --override-generation-config {&quot;temperature&quot;:0.7}   SGLang: --chat-template qwen2-vl"></textarea>
           </label>
           <label class="wide">Extra environment (KEY=VALUE per line)
-            <textarea id="f-env" rows="2" placeholder="VLLM_USE_V1=1"></textarea>
+            <textarea id="f-env" rows="2" placeholder="VLLM_USE_V1=1  (or SGLANG_… for SGLang)"></textarea>
           </label>
         </details>
+
+        <!-- SGLang-only knobs; hidden until Engine == SGLang. Flag names/values
+             match `sglang.launch_server --help` from the installed 0.5.18. -->
+        <div class="engine-block" data-engine="sglang" hidden>
+        <details>
+          <summary>SGLang</summary>
+          <p class="muted-text" style="margin-bottom:8px">
+            Shared fields above (dtype, quantization, TP/PP, max-model-len → context-length,
+            max-num-seqs → max-running-requests, GPU-memory-util → mem-fraction-static,
+            KV-cache-dtype, attention-backend, trust-remote-code, reasoning-parser)
+            carry over to SGLang's equivalent flags automatically. Values that only
+            exist in one engine (e.g. vLLM's <code>FLASH_ATTN</code> vs SGLang's
+            <code>fa3</code>) need to be switched manually.
+          </p>
+          <div class="grid">
+            <label>Load format
+              <select id="f-sglang_load_format">
+                <option value="">auto</option><option>pt</option><option>safetensors</option>
+                <option>gguf</option><option>bitsandbytes</option><option>dummy</option>
+                <option>runai_streamer</option>
+              </select>
+            </label>
+            <label>Schedule policy
+              <select id="f-sglang_schedule_policy">
+                <option value="">lpm</option><option>fcfs</option><option>random</option>
+                <option>dfs-weight</option><option>lof</option><option>priority</option>
+              </select>
+            </label>
+            <label>Max total tokens<input id="f-sglang_max_total_tokens" type="number" placeholder="auto" /></label>
+            <label>DP size<input id="f-sglang_dp_size" type="number" min="1" placeholder="1" /></label>
+            <label>EP size<input id="f-sglang_ep_size" type="number" min="1" placeholder="1" /></label>
+            <label>CUDA-graph decode
+              <select id="f-sglang_cuda_graph_backend_decode">
+                <option value="">full</option><option>breakable</option>
+                <option>tc_piecewise</option><option>disabled</option>
+              </select>
+            </label>
+            <label>CUDA-graph prefill
+              <select id="f-sglang_cuda_graph_backend_prefill">
+                <option value="">full</option><option>breakable</option>
+                <option>tc_piecewise</option><option>disabled</option>
+              </select>
+            </label>
+            <label>Mamba backend
+              <select id="f-sglang_mamba_backend">
+                <option value="">triton</option><option>flashinfer</option>
+              </select>
+            </label>
+            <label>Mamba SSM dtype
+              <select id="f-sglang_mamba_ssm_dtype">
+                <option value="">bfloat16</option><option>float16</option><option>float32</option>
+              </select>
+            </label>
+            <label>Max mamba cache size<input id="f-sglang_max_mamba_cache_size" type="number" placeholder="auto" /></label>
+            <label>Mamba full mem ratio<input id="f-sglang_mamba_full_memory_ratio" type="number" step="0.01" min="0" max="1" placeholder="1.0" /></label>
+            <label>Disable radix cache<select id="f-sglang_disable_radix_cache" class="tri"></select></label>
+            <label>Disable overlap sched.<select id="f-sglang_disable_overlap_schedule" class="tri"></select></label>
+            <label>Deterministic infer.<select id="f-sglang_enable_deterministic_inference" class="tri"></select></label>
+            <label>Enable multimodal<select id="f-sglang_enable_multimodal" class="tri"></select></label>
+            <label>DP attention<select id="f-sglang_enable_dp_attention" class="tri"></select></label>
+          </div>
+        </details>
+        <details>
+          <summary>SGLang · Speculative / MTP</summary>
+          <p class="muted-text" style="margin-bottom:8px">
+            For NEXTN (MTP) checkpoints like unsloth/Qwen3.8-27B-NVFP4 the
+            draft heads are inside the main safetensors, so <code>Draft model</code>
+            is only needed for an external draft. Leave <code>Top-k</code> empty
+            (or 1) for MTP; it becomes &gt;1 when using an EAGLE-class draft model.
+          </p>
+          <div class="grid">
+            <label>Algorithm
+              <input id="f-sglang_speculative_algorithm" list="spec-algo-list"
+                     placeholder="NEXTN (EAGLE, EAGLE3, …)" />
+            </label>
+            <label>Draft model<input id="f-sglang_speculative_draft_model"
+                  placeholder="(embedded for NEXTN)" /></label>
+            <label>Num steps<input id="f-sglang_speculative_num_steps" type="number" min="1" placeholder="auto" /></label>
+            <label>Top-k<input id="f-sglang_speculative_eagle_topk" type="number" min="1" placeholder="auto (1 for MTP)" /></label>
+            <label>Draft tokens<input id="f-sglang_speculative_num_draft_tokens" type="number" min="1" placeholder="auto" /></label>
+          </div>
+        </details>
+        </div>
+        <!-- end engine-block -->
 
         <div class="command-preview">
           <div class="preview-head"><span>Command preview</span><button class="ghost" id="copy-cmd">Copy</button></div>
           <code id="cmd-preview">select a model…</code>
         </div>
+        <div class="notes" id="preview-notes"></div>
 
         <div class="actions">
           <button class="primary" id="launch-btn" disabled>Load model</button>
@@ -286,6 +378,10 @@
   <datalist id="tool-list">
     <option>qwen3_xml</option><option>qwen3_coder</option><option>hermes</option>
     <option>llama3_json</option><option>mistral</option><option>pythonic</option><option>openai</option>
+  </datalist>
+  <datalist id="spec-algo-list">
+    <option>NEXTN</option><option>EAGLE</option><option>EAGLE3</option>
+    <option>STANDALONE</option><option>NGRAM</option><option>DFLASH</option><option>DSPARK</option>
   </datalist>
 
   <script src="/static/app.js"></script>
