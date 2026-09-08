@@ -26,9 +26,10 @@ Environment="VLLM_LAUNCHER_PORT=7870"
 #   VLLM_BIN / SGLANG_BIN        alternative: path to the engine's executable
 #   HF_HOME                      defaults to ~/.cache/huggingface
 #   VLLM_LAUNCHER_MODEL_ROOTS    defaults to $HF_HOME/hub:~/models
-#   VLLM_LAUNCHER_EXTERNAL_PORT  port to adopt a foreign OpenAI-compatible server from (8000)
-#   VLLM_LAUNCHER_MIN_FREE_RAM_GIB / _RAM_KILL_GIB / _RAM_PSI_FULL / _JIT_MAX_JOBS
-#                                host-RAM guard thresholds (README: "Host RAM guards")
+#   VLLM_LAUNCHER_EXTERNAL_PORT  ports to adopt a foreign OpenAI-compatible server from (8000,30000)
+#   VLLM_LAUNCHER_MIN_FREE_RAM_GIB / _RAM_KILL_GIB / _RAM_PSI_FULL / _JIT_MAX_JOBS /
+#   _ENGINE_RAM_RESERVE_GIB      host-RAM guard thresholds (README: "Host RAM guards")
+#   VLLM_LAUNCHER_STATE_DIR      run logs + JIT linker shims (default ~/.cache/vllm-launcher)
 # CUDA_HOME / LD_LIBRARY_PATH are derived per launch from the *selected* engine's env (its
 # pip-installed nvidia/cu13 toolkit); values set here that point into a different engine's
 # env are dropped for that launch, so a single EnvironmentFile is safe for both engines.
@@ -37,9 +38,10 @@ Environment="VLLM_LAUNCHER_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,19
 
 # Hard host-RAM ceiling enforced by the kernel for the launcher AND every engine it spawns
 # (children inherit the cgroup). The launcher's own watchdog is the first line of defence;
-# this is the backstop for when the box is already too thrashed to run it. Size it to leave
-# the desktop about half the machine (16G/13G on a 30 GiB box); capping at nearly all of RAM
-# still starves everything outside the cgroup.
+# this is the backstop for when the box is already too thrashed to run it. The launcher reads
+# the cap back and sizes kernel-JIT parallelism to fit inside it. Size it to leave the desktop
+# about half the machine (16G/13G on a 30 GiB box); capping at nearly all of RAM still starves
+# everything outside the cgroup.
 #MemoryHigh=13G
 #MemoryMax=16G
 #MemorySwapMax=2G

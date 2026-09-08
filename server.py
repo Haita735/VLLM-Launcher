@@ -223,10 +223,14 @@ def _hf_cli() -> list[str]:
 # Hugging Face's own default location when HF_HOME is not set.
 HF_HOME = os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
 
-# An OpenAI-compatible server on this port may be owned by another manager. The launcher
-# adopts it read-only rather than competing for the GPUs; EXTERNAL_NAME is only used in
-# messages that tell the user where to go to stop it.
-EXTERNAL_PORT = int(os.environ.get("VLLM_LAUNCHER_EXTERNAL_PORT", "8000"))
+# An OpenAI-compatible server on one of these ports may be owned by another manager. The
+# launcher adopts it read-only rather than competing for the GPUs; EXTERNAL_NAME is only
+# used in messages that tell the user where to go to stop it. Defaults cover vLLM's (8000)
+# and SGLang's (30000) stock ports.
+EXTERNAL_PORTS = [
+    int(p) for p in os.environ.get("VLLM_LAUNCHER_EXTERNAL_PORT", "8000,30000").split(",") if p.strip()
+] or [8000]
+EXTERNAL_PORT = EXTERNAL_PORTS[0]
 EXTERNAL_API_KEY = os.environ.get("VLLM_LAUNCHER_EXTERNAL_API_KEY") or None
 EXTERNAL_NAME = os.environ.get("VLLM_LAUNCHER_EXTERNAL_NAME") or "the tool that launched it"
 
@@ -263,16 +267,83 @@ def _env_float(name: str, default: float) -> float:
 # killer to log anything. Three layers, all tunable:
 #   1. refuse to launch when MemAvailable is already below MIN_FREE_RAM_GIB;
 #   2. derive MAX_JOBS (ninja parallelism used by FlashInfer / SGLang / tvm-ffi JIT) from
-#      the RAM that is actually free, never raising an inherited value;
+#      the RAM that is actually free *and* from the cgroup limit the launcher runs under
+#      (systemd MemoryMax/MemoryHigh, Docker --memory: the engine inherits it), minus what
+#      the engine's own processes need, never raising an inherited value;
 #   3. a watchdog SIGKILLs the engine's process group if MemAvailable drops below
 #      RAM_KILL_GIB or the kernel reports the system fully stalled on memory (PSI).
 MIN_FREE_RAM_GIB = _env_float("VLLM_LAUNCHER_MIN_FREE_RAM_GIB", 4.0)
 RAM_KILL_GIB = _env_float("VLLM_LAUNCHER_RAM_KILL_GIB", 2.0)
 RAM_PSI_FULL_KILL = _env_float("VLLM_LAUNCHER_RAM_PSI_FULL", 25.0)  # % of last 10 s stalled
 JIT_RAM_PER_JOB_GIB = _env_float("VLLM_LAUNCHER_JIT_RAM_PER_JOB_GIB", 6.0)
-JIT_RAM_HEADROOM_GIB = _env_float("VLLM_LAUNCHER_JIT_RAM_HEADROOM_GIB", 6.0)
+# Measured: SGLang's scheduler + tokenizer + detokenizer sit at ~6 GiB of anonymous memory
+# while a model loads; vLLM's engine core is similar. The JIT budget is what is left after that.
+ENGINE_RAM_RESERVE_GIB = _env_float("VLLM_LAUNCHER_ENGINE_RAM_RESERVE_GIB", 6.0)
 JIT_MAX_JOBS_CAP = max(1, int(_env_float("VLLM_LAUNCHER_JIT_MAX_JOBS", 4)))
 GIB = 1024**3
+# Launcher-owned state that must survive restarts: on-disk engine logs (a host freeze wipes
+# the in-memory buffer, and that is exactly when the log matters) and toolchain shims.
+STATE_DIR = Path(os.environ.get("VLLM_LAUNCHER_STATE_DIR", "~/.cache/vllm-launcher")).expanduser()
+LOG_DIR = STATE_DIR / "logs"
+LOG_FILES_KEPT = max(1, int(_env_float("VLLM_LAUNCHER_LOG_FILES_KEPT", 10)))
+
+
+def _cgroup_memory() -> dict:
+    """Memory limits that apply to *this* process through cgroup v2, walking up from the
+    leaf so a cap on a parent slice (or a container's root) is seen too. Values are the
+    tightest limit found; None means unlimited/unavailable."""
+    info: dict[str, Any] = {
+        "path": None, "max_bytes": None, "high_bytes": None,
+        "current_bytes": None, "anon_bytes": None, "oom_kills": None, "psi_full_avg10": None,
+    }
+    try:
+        with open("/proc/self/cgroup", encoding="ascii") as handle:
+            line = next((l for l in handle if l.startswith("0::")), None)
+    except OSError:
+        return info
+    if not line:
+        return info  # cgroup v1: no single memory limit to read
+    rel = line.strip()[3:]
+    leaf = Path("/sys/fs/cgroup" + rel)
+    info["path"] = rel or "/"
+
+    def read_int(path: Path) -> int | None:
+        try:
+            text = path.read_text(encoding="ascii").strip()
+        except OSError:
+            return None
+        return None if text == "max" else int(text.split()[0])
+
+    info["current_bytes"] = read_int(leaf / "memory.current")
+    # memory.current counts page cache (mmap'd weights) that the kernel reclaims on demand;
+    # anon is what actually has to fit under the limit.
+    try:
+        for entry in (leaf / "memory.stat").read_text(encoding="ascii").splitlines():
+            if entry.startswith("anon "):
+                info["anon_bytes"] = int(entry.split()[1])
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    node = leaf
+    while str(node).startswith("/sys/fs/cgroup"):
+        for key, name in (("max_bytes", "memory.max"), ("high_bytes", "memory.high")):
+            value = read_int(node / name)
+            if value is not None and (info[key] is None or value < info[key]):
+                info[key] = value
+        node = node.parent
+    try:
+        for entry in (leaf / "memory.events").read_text(encoding="ascii").splitlines():
+            if entry.startswith("oom_kill "):
+                info["oom_kills"] = int(entry.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        for entry in (leaf / "memory.pressure").read_text(encoding="ascii").splitlines():
+            if entry.startswith("full"):
+                info["psi_full_avg10"] = float(entry.split("avg10=")[1].split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return info
 
 
 def ram_snapshot() -> dict:
@@ -302,19 +373,71 @@ def ram_snapshot() -> dict:
                     info["psi_full_avg10"] = float(line.split("avg10=")[1].split()[0])
     except (OSError, ValueError, IndexError):
         pass
+    info["cgroup"] = _cgroup_memory()
     return info
 
 
-def jit_jobs_for(available_bytes: int | None, inherited: str | None) -> int:
-    """Parallel nvcc jobs that fit in the RAM that is free right now, leaving headroom for
-    the engine processes themselves. An inherited MAX_JOBS is only ever lowered."""
+def ram_budget(ram: dict) -> tuple[int | None, str]:
+    """Bytes the engine may still allocate before something breaks, and where that bound
+    comes from: host MemAvailable, or the launcher's cgroup limit minus what the cgroup
+    already holds (the kernel OOM-kills inside the cgroup at memory.max and throttles the
+    engine to a crawl above memory.high, long before the host itself is short of RAM)."""
+    candidates: list[tuple[int, str]] = []
+    if ram.get("available_bytes") is not None:
+        candidates.append((ram["available_bytes"], "host MemAvailable"))
+    cg = ram.get("cgroup") or {}
+    used = cg.get("anon_bytes")
+    if used is None:
+        used = cg.get("current_bytes") or 0
+    for key, label in (("high_bytes", "cgroup memory.high"), ("max_bytes", "cgroup memory.max")):
+        limit = cg.get(key)
+        if limit is not None:
+            candidates.append((max(0, limit - used), label))
+    if not candidates:
+        return None, "unknown"
+    return min(candidates)
+
+
+def top_ram_consumers(limit: int = 3, min_bytes: int = GIB) -> list[str]:
+    """Largest anonymous-memory users on the host, so the launch notes can say *what* is
+    occupying the RAM the engine will not get (browsers and IDEs routinely hold 5-10 GiB)."""
+    rows: list[tuple[int, str]] = []
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/status", encoding="ascii", errors="replace") as handle:
+                name, anon = "", 0
+                for line in handle:
+                    if line.startswith("Name:"):
+                        name = line.split(None, 1)[1].strip()
+                    elif line.startswith("RssAnon:"):
+                        anon = int(line.split()[1]) * 1024
+                        break
+        except (OSError, ValueError, IndexError):
+            continue
+        if anon >= min_bytes:
+            rows.append((anon, name))
+    rows.sort(reverse=True)
+    return [f"{name} {anon / GIB:.1f} GiB" for anon, name in rows[:limit]]
+
+
+def jit_jobs_for(ram: dict, inherited: str | None) -> tuple[int, str]:
+    """Parallel nvcc jobs that fit in the RAM budget after the engine's own processes are
+    accounted for. An inherited MAX_JOBS is only ever lowered. Returns (jobs, reason)."""
     cap = JIT_MAX_JOBS_CAP
     if inherited and inherited.isdigit() and int(inherited) > 0:
         cap = min(cap, int(inherited))
-    if available_bytes is None:
-        return min(cap, 2)
-    fits = int((available_bytes / GIB - JIT_RAM_HEADROOM_GIB) // JIT_RAM_PER_JOB_GIB)
-    return max(1, min(cap, fits))
+    budget, source = ram_budget(ram)
+    if budget is None:
+        return 1, "RAM budget unknown"
+    free_for_jit = budget / GIB - ENGINE_RAM_RESERVE_GIB
+    fits = int(free_for_jit // JIT_RAM_PER_JOB_GIB)
+    jobs = max(1, min(cap, fits))
+    return jobs, (
+        f"{source} {budget / GIB:.1f} GiB - {ENGINE_RAM_RESERVE_GIB:g} GiB engine reserve "
+        f"= {max(0.0, free_for_jit):.1f} GiB for JIT at ~{JIT_RAM_PER_JOB_GIB:g} GiB per nvcc job"
+    )
 
 # Networks allowed to reach the UI. Tailscale's 100.64.0.0/10 is not covered by
 # ipaddress.is_private, so the ranges are listed explicitly.
@@ -498,11 +621,13 @@ def system_info() -> dict:
                 "external_port": EXTERNAL_PORT,
                 "hf_home": HF_HOME,
                 "hf_cli": shlex.join(_hf_cli()),
+                "log_dir": str(LOG_DIR),
                 "ram_guard": {
                     "min_free_gib": MIN_FREE_RAM_GIB,
                     "kill_gib": RAM_KILL_GIB,
                     "psi_full_kill": RAM_PSI_FULL_KILL,
                     "jit_ram_per_job_gib": JIT_RAM_PER_JOB_GIB,
+                    "engine_reserve_gib": ENGINE_RAM_RESERVE_GIB,
                 },
                 "access_urls": [
                     f"http://{addr}:{os.environ.get('VLLM_LAUNCHER_PORT', '7870')}"
@@ -748,15 +873,16 @@ def compatibility_notes(entry: dict) -> list[dict]:
             notes.append(
                 {
                     "level": "info",
-                    "text": "No native FP4 tensor cores: vLLM runs NVFP4 weight-only (W4A16) "
-                    "through the Marlin kernel. Pin it with linear-backend=marlin.",
+                    "text": "No native FP4 tensor cores on this GPU. vLLM: runs NVFP4 weight-only "
+                    "(W4A16) through Marlin - pin it with linear-backend=marlin. SGLang: check that "
+                    "its NVFP4 kernels support this compute capability before loading.",
                 }
             )
     if "fp8" in detail and cap and cap < 89:
         notes.append(
             {
                 "level": "info",
-                "text": "FP8 weights are dequantised by Marlin on this GPU; compute stays fp16.",
+                "text": "FP8 weights are dequantised on this GPU (no FP8 tensor cores); compute stays fp16.",
             }
         )
     if quant.get("kv_cache") and "8" in str(quant.get("kv_cache")) and cap and cap < 89:
@@ -764,11 +890,11 @@ def compatibility_notes(entry: dict) -> list[dict]:
             {
                 "level": "warn",
                 "text": "Checkpoint ships fp8 KV scales, so kv-cache-dtype=auto resolves to fp8, "
-                "which needs SM89+. Set kv-cache-dtype=float16 explicitly.",
+                "which needs SM89+. Set kv-cache-dtype explicitly (vLLM: float16; SGLang: bf16).",
             }
         )
     if entry.get("multimodal"):
-        notes.append({"level": "info", "text": "Multimodal checkpoint; limit-mm-per-prompt applies."})
+        notes.append({"level": "info", "text": "Multimodal checkpoint; vLLM: limit-mm-per-prompt applies, SGLang: enable multimodal in its section."})
     return notes
 
 
@@ -954,6 +1080,140 @@ def _append_extra_args(argv: list[str], extra_args: str) -> None:
     argv += extra
 
 
+_nvcc_version_cache: dict[str, str | None] = {}
+
+
+def _nvcc_version(cuda_root: Path) -> str | None:
+    """`major.minor` of the toolkit's nvcc, probed once per toolkit."""
+    key = str(cuda_root)
+    if key not in _nvcc_version_cache:
+        version = None
+        try:
+            out = subprocess.run(
+                [str(cuda_root / "bin" / "nvcc"), "--version"],
+                capture_output=True, text=True, timeout=20, check=True,
+            ).stdout
+            match = re.search(r"release (\d+)\.(\d+)", out)
+            version = f"{match.group(1)}.{match.group(2)}" if match else None
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _nvcc_version_cache[key] = version
+    return _nvcc_version_cache[key]
+
+
+def _cudart_header_version(cuda_root: Path) -> str | None:
+    """`major.minor` of the CUDA runtime headers (CUDART_VERSION 13000 -> 13.0)."""
+    try:
+        text = (cuda_root / "include" / "cuda_runtime_api.h").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"#define\s+CUDART_VERSION\s+(\d+)", text)
+    if not match:
+        return None
+    value = int(match.group(1))
+    return f"{value // 1000}.{(value % 1000) // 10}"
+
+
+def _dist_version(python: Path, project: str) -> str | None:
+    """Installed version of a pip project in the engine's env, from its .dist-info name."""
+    wanted = re.sub(r"[-_.]+", "_", project).lower()
+    for site in _site_packages(python):
+        for info in site.glob("*.dist-info"):
+            name, _, version = info.name[: -len(".dist-info")].partition("-")
+            if re.sub(r"[-_.]+", "_", name).lower() == wanted and version:
+                return version
+    return None
+
+
+def _flashinfer_version_mismatch(engine: Engine) -> str | None:
+    """FlashInfer refuses to start when its companion wheels (`flashinfer-cubin`,
+    `flashinfer-jit-cache`) are not the exact same release - which happens whenever an
+    engine pins a flashinfer-python version whose companions were never published. Mirrors
+    FlashInfer's own check so the bypass is only set when it would otherwise fail."""
+    if not engine.python:
+        return None
+    core = _dist_version(engine.python, "flashinfer-python") or _dist_version(engine.python, "flashinfer")
+    if not core:
+        return None
+    cubin = _dist_version(engine.python, "flashinfer-cubin")
+    if cubin and cubin != core:
+        return f"flashinfer-python {core} vs flashinfer-cubin {cubin}"
+    jit_cache = _dist_version(engine.python, "flashinfer-jit-cache")
+    if jit_cache and not jit_cache.startswith(core):
+        return f"flashinfer-python {core} vs flashinfer-jit-cache {jit_cache}"
+    return None
+
+
+def _jit_toolchain(cuda_root: Path, engine: Engine, env: dict[str, str]) -> list[str]:
+    """Make kernel JIT (FlashInfer, tvm-ffi / sgl-kernel, torch cpp_extension) *link* against
+    a pip-installed CUDA toolkit without hand-patching site-packages.
+
+    The `nvidia-cuda-*` wheels lay the toolkit out as `nvidia/cu13/lib/` holding only
+    versioned sonames (`libcudart.so.13`), while the JIT builders emit
+    `-L$CUDA_HOME/lib64 -lcudart -lcuda` as if it were a system CUDA install. The result
+    is `ld: cannot find -lcudart` on the first kernel that needs compiling - hours into a
+    load, after the weights are already on the GPU. A launcher-owned directory of
+    `libX.so -> <toolkit>/lib/libX.so.N` symlinks placed on LIBRARY_PATH (honoured by gcc
+    and clang for every `-l` lookup) and in FLASHINFER_EXTRA_LDFLAGS makes every builder
+    resolve them; `libcuda.so` itself comes from the driver package on the system.
+    Notes describe what was set."""
+    notes: list[str] = []
+    lib_dir = cuda_root / "lib"
+    if not lib_dir.is_dir():
+        return notes
+    shim_dir = STATE_DIR / "toolchain" / engine.name / "lib"
+    linked: list[str] = []
+    try:
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        for so in sorted(lib_dir.glob("lib*.so.*")):
+            # libcudart.so.13 -> libcudart.so; skip libnvrtc-builtins.so.13.0 style names that
+            # are never linked by name, and anything the toolkit already ships unversioned.
+            match = re.match(r"^(lib[A-Za-z0-9_]+)\.so\.\d+$", so.name)
+            if not match or (lib_dir / f"{match.group(1)}.so").exists():
+                continue
+            link = shim_dir / f"{match.group(1)}.so"
+            if link.is_symlink() and link.resolve() == so.resolve():
+                linked.append(link.name)
+                continue
+            if link.exists() or link.is_symlink():
+                link.unlink()
+            link.symlink_to(so)
+            linked.append(link.name)
+    except OSError as exc:
+        notes.append(f"could not prepare JIT linker shims in {shim_dir}: {exc}")
+        return notes
+
+    search = [str(shim_dir), str(lib_dir)]
+    stubs = lib_dir / "stubs"
+    if stubs.is_dir():
+        search.append(str(stubs))
+    inherited = [p for p in env.get("LIBRARY_PATH", "").split(os.pathsep) if p and p not in search]
+    env["LIBRARY_PATH"] = os.pathsep.join(search + inherited)
+    ldflags = shlex.split(env.get("FLASHINFER_EXTRA_LDFLAGS", ""))
+    for path in search:
+        if f"-L{path}" not in ldflags:
+            ldflags.append(f"-L{path}")
+    env["FLASHINFER_EXTRA_LDFLAGS"] = shlex.join(ldflags)
+    if linked:
+        shown = ", ".join(linked[:3]) + (f" +{len(linked) - 3} more" if len(linked) > 3 else "")
+        notes.append(
+            f"pip CUDA toolkit has no unversioned .so names for the linker; {len(linked)} shims "
+            f"({shown}) in {shim_dir} via LIBRARY_PATH / FLASHINFER_EXTRA_LDFLAGS."
+        )
+
+    # The wheels are versioned independently: nvcc 13.3 next to 13.0 runtime headers is
+    # normal, and CCCL's compatibility guard aborts the compile on that mismatch.
+    nvcc = _nvcc_version(cuda_root)
+    headers = _cudart_header_version(cuda_root)
+    define = "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK"
+    cudaflags = shlex.split(env.get("FLASHINFER_EXTRA_CUDAFLAGS", ""))
+    if nvcc and headers and nvcc != headers and define not in cudaflags:
+        cudaflags.append(define)
+        env["FLASHINFER_EXTRA_CUDAFLAGS"] = shlex.join(cudaflags)
+        notes.append(f"nvcc {nvcc} vs CUDA runtime headers {headers}: added {define} for JIT.")
+    return notes
+
+
 def _resolve_env(spec: LaunchSpec, engine: Engine) -> tuple[dict[str, str], list[str]]:
     """Process environment for the engine, plus human-readable notes about what was derived.
 
@@ -968,10 +1228,12 @@ def _resolve_env(spec: LaunchSpec, engine: Engine) -> tuple[dict[str, str], list
     env = os.environ.copy()
     env.setdefault("HF_HOME", HF_HOME)
     env.setdefault("HF_HUB_OFFLINE", "1")
-    # vLLM 0.26 pins flashinfer-python==0.6.14 but flashinfer-cubin has no 0.6.14 release.
-    env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     env["PYTHONUNBUFFERED"] = "1"
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    mismatch = _flashinfer_version_mismatch(engine)
+    if mismatch and "FLASHINFER_DISABLE_VERSION_CHECK" not in env:
+        env["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
+        notes.append(f"{mismatch}: set FLASHINFER_DISABLE_VERSION_CHECK=1 so FlashInfer starts anyway.")
 
     # An EnvironmentFile written for one engine typically carries that engine's toolkit
     # paths (~/vllm-launcher.env points CUDA_HOME/LD_LIBRARY_PATH into the vLLM env).
@@ -1011,6 +1273,7 @@ def _resolve_env(spec: LaunchSpec, engine: Engine) -> tuple[dict[str, str], list
             env["LD_LIBRARY_PATH"] = os.pathsep.join(
                 [str(lib_dir)] + [p for p in kept_ld if p != str(lib_dir)]
             )
+        notes += _jit_toolchain(cuda_root, engine, env)
     elif not env.get("CUDA_HOME") and Path("/usr/local/cuda/bin/nvcc").exists():
         env["CUDA_HOME"] = "/usr/local/cuda"
 
@@ -1025,20 +1288,37 @@ def _resolve_env(spec: LaunchSpec, engine: Engine) -> tuple[dict[str, str], list
     if spec.gpu_indices:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in sorted(set(spec.gpu_indices)))
 
-    # Kernel JIT parallelism sized to the RAM that is free *now* (see the guard notes at
-    # the top of the file). Honoured by FlashInfer, SGLang's kernel JIT and tvm-ffi.
+    # Kernel JIT parallelism sized to the RAM budget *now* (see the guard notes at the top
+    # of the file). Honoured by FlashInfer, SGLang's kernel JIT and tvm-ffi.
     ram = ram_snapshot()
-    jobs = jit_jobs_for(ram["available_bytes"], env.get("MAX_JOBS"))
+    jobs, reason = jit_jobs_for(ram, env.get("MAX_JOBS"))
     env["MAX_JOBS"] = str(jobs)
     env.setdefault("FLASHINFER_NVCC_THREADS", "1")
-    available = ram["available_bytes"]
-    notes.append(
-        f"RAM available {available / GIB:.1f} GiB -> MAX_JOBS={jobs} for kernel JIT "
-        f"(~{JIT_RAM_PER_JOB_GIB:g} GiB per nvcc job); watchdog kills the engine below "
-        f"{RAM_KILL_GIB:g} GiB free."
-        if available is not None
-        else f"RAM unknown (/proc/meminfo unreadable) -> MAX_JOBS={jobs}."
-    )
+    notes.append(f"MAX_JOBS={jobs}: {reason}.")
+    expected = ENGINE_RAM_RESERVE_GIB + jobs * JIT_RAM_PER_JOB_GIB
+    budget, _ = ram_budget(ram)
+    if budget is not None and expected * GIB > budget:
+        notes.append(
+            f"WARNING: if this start has to JIT-compile kernels, host RAM may peak at ~{expected:g} GiB "
+            f"(engine + {jobs} nvcc job) against a {budget / GIB:.1f} GiB budget - the compile could be "
+            "throttled or OOM-killed. Starts with cached kernels are unaffected; close other programs "
+            "or raise the cap for a first start."
+        )
+    cg = ram.get("cgroup") or {}
+    if cg.get("max_bytes") is not None or cg.get("high_bytes") is not None:
+        limits = ", ".join(
+            f"{label} {cg[key] / GIB:.0f} GiB"
+            for key, label in (("high_bytes", "high"), ("max_bytes", "max")) if cg.get(key) is not None
+        )
+        used = cg.get("anon_bytes") if cg.get("anon_bytes") is not None else (cg.get("current_bytes") or 0)
+        notes.append(
+            f"launcher cgroup ({limits}; {used / GIB:.1f} GiB anon in use) - "
+            "the engine inherits this cap: the kernel throttles above high and OOM-kills at max."
+        )
+    consumers = top_ram_consumers()
+    if consumers:
+        notes.append("largest other RAM users: " + ", ".join(consumers) + ".")
+    notes.append(f"watchdog kills the engine below {RAM_KILL_GIB:g} GiB host RAM available.")
 
     for key, value in spec.env.items():
         if not _ENV_KEY_RE.match(key):
@@ -1234,6 +1514,105 @@ def build_command(spec: LaunchSpec) -> tuple[list[str], dict[str, str], list[str
 
 
 # --------------------------------------------------------------------------------------
+# Kernel JIT progress
+# --------------------------------------------------------------------------------------
+# FlashInfer, sgl-kernel and tvm-ffi compile kernels through `ninja -C <dir>` with the output
+# captured, and the engine's own progress bar blocks on the result, so a first start looks
+# hung for as long as the compile runs (18 min for one CUTLASS FP4 op at MAX_JOBS=1). The
+# launcher watches the engine's process group for the build and reports it instead.
+_COMPILER_COMMS = {"cicc", "ptxas", "nvcc", "cudafe++", "fatbinary", "nvlink", "cc1plus", "ld", "collect2"}
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def _boot_time() -> float:
+    try:
+        with open("/proc/stat", encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("btime "):
+                    return float(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0.0
+
+
+def _session_processes(sid: int) -> list[dict]:
+    """pid, comm, argv, cwd and start time (epoch) for every live process in the session.
+    The engine is started with start_new_session=True, so its session id is its pid and
+    everything it spawns inherits it - including ninja's compile jobs, which ninja moves
+    into process groups of their own (a plain pgid match misses every `cicc`)."""
+    found = []
+    boot = _boot_time()
+    for entry in os.scandir("/proc"):
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/stat", encoding="ascii", errors="replace") as handle:
+                stat = handle.read()
+            # comm can contain spaces or parentheses: split on the *last* ')'.
+            close = stat.rindex(")")
+            fields = stat[close + 2:].split()  # state ppid pgrp session ... starttime@[19]
+            if int(fields[3]) != sid:
+                continue
+            with open(f"/proc/{entry.name}/cmdline", "rb") as handle:
+                argv = [a.decode("utf-8", "replace") for a in handle.read().split(b"\0") if a]
+            found.append({
+                "pid": int(entry.name),
+                "comm": stat[stat.index("(") + 1:close],
+                "argv": argv,
+                "cwd": os.readlink(f"/proc/{entry.name}/cwd"),
+                "started": boot + int(fields[19]) / _CLK_TCK,
+            })
+        except (OSError, ValueError, IndexError):
+            continue
+    return found
+
+
+def jit_progress(sid: int) -> dict | None:
+    """What the engine's ninja build is doing right now, or None when none is running.
+    Progress comes from ninja's own bookkeeping: targets in build.ninja versus .ninja_log
+    entries whose output mtime is newer than the ninja process, i.e. finished by *this* run."""
+    procs = _session_processes(sid)
+    ninjas = sorted((p for p in procs if p["comm"] == "ninja"), key=lambda p: p["started"])
+    if not ninjas:
+        return None
+    ninja = ninjas[0]
+    argv = ninja["argv"]
+    build_dir = Path(argv[argv.index("-C") + 1]) if "-C" in argv[:-1] else Path(ninja["cwd"])
+    if not build_dir.is_absolute():
+        build_dir = Path(ninja["cwd"]) / build_dir
+    name = build_dir.parent.name if build_dir.name.startswith("build-") else build_dir.name
+
+    total = 0
+    try:
+        with open(build_dir / "build.ninja", encoding="utf-8", errors="replace") as handle:
+            total = sum(1 for line in handle if line.startswith("build "))
+    except OSError:
+        pass
+    done, durations = 0, []
+    try:
+        with open(build_dir / ".ninja_log", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("#"):
+                    continue
+                start_ms, end_ms, mtime = line.split("\t")[:3]
+                mtime_s = int(mtime) / 1e9 if int(mtime) > 1e12 else int(mtime)  # ns (log v5+) or s
+                if mtime_s >= ninja["started"] - 1:
+                    done += 1
+                    durations.append((int(end_ms) - int(start_ms)) / 1000)
+    except (OSError, ValueError):
+        pass
+    return {
+        "op": name,
+        "dir": str(build_dir),
+        "done": done,
+        "total": total,
+        "compilers": sum(1 for p in procs if p["comm"] in _COMPILER_COMMS),
+        "avg_step_s": round(sum(durations) / len(durations), 1) if durations else None,
+        "elapsed_s": round(time.time() - ninja["started"]),
+    }
+
+
+# --------------------------------------------------------------------------------------
 # Runtime
 # --------------------------------------------------------------------------------------
 class EventLog:
@@ -1292,6 +1671,13 @@ class Runtime:
     command: list[str] = field(default_factory=list)
     started_at: float | None = None
     adopted: bool = False
+    log_file: Path | None = None
+    _log_handle: Any = None
+    _kill_reason: str | None = None  # set by the watchdog / Stop before they SIGKILL
+    _oom_kills_at_start: int | None = None
+    _max_jobs: int = 1
+    _jit: dict | None = None  # current kernel JIT build, for /api/status and the log
+    _external_engines: dict = field(default_factory=dict)  # port -> detected engine of an adopted server
 
     def __post_init__(self):
         self.condition = threading.Condition(self.lock)
@@ -1299,10 +1685,42 @@ class Runtime:
     # -- logging ------------------------------------------------------------------
     def _append_locked(self, line: str):
         self.sequence += 1
-        self.events.append(
-            {"sequence": self.sequence, "timestamp": time.time(), "line": line.rstrip("\n")}
-        )
+        line = line.rstrip("\n")
+        self.events.append({"sequence": self.sequence, "timestamp": time.time(), "line": line})
+        if self._log_handle is not None:
+            try:
+                self._log_handle.write(line + "\n")
+            except OSError:
+                self._log_handle = None
         self.condition.notify_all()
+
+    def _note_locked(self, line: str):
+        """Launcher-originated line: into the run log *and* stderr, so journald keeps a copy
+        of watchdog kills and exit diagnoses even if the host goes down right after."""
+        self._append_locked(line)
+        print(f"launcher: {line}", file=sys.stderr, flush=True)
+
+    def _open_run_log_locked(self, engine: str) -> None:
+        self._close_run_log_locked()
+        try:
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            self.log_file = LOG_DIR / f"{engine}-{stamp}.log"
+            self._log_handle = open(self.log_file, "a", encoding="utf-8", buffering=1)
+            for stale in sorted(LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime)[:-LOG_FILES_KEPT]:
+                stale.unlink(missing_ok=True)
+        except OSError as exc:
+            self.log_file = None
+            self._log_handle = None
+            self._append_locked(f"launcher: could not open a run log under {LOG_DIR}: {exc}")
+
+    def _close_run_log_locked(self) -> None:
+        if self._log_handle is not None:
+            try:
+                self._log_handle.close()
+            except OSError:
+                pass
+            self._log_handle = None
 
     def log(self, line: str):
         with self.lock:
@@ -1365,7 +1783,12 @@ class Runtime:
                     detail=f"A {engine} process is already running",
                 )
             self.adopted = False
+            self._kill_reason = None
+            self._jit = None
+            self._max_jobs = int(env.get("MAX_JOBS") or 1)
+            self._oom_kills_at_start = (ram.get("cgroup") or {}).get("oom_kills")
             self.events.clear()  # sequence is deliberately *not* reset: see EventLog.clear
+            self._open_run_log_locked(engine)
             self._append_locked(f"$ {shlex.join(argv)}")
             visible = env.get("CUDA_VISIBLE_DEVICES", "all")
             self._append_locked(
@@ -1374,6 +1797,8 @@ class Runtime:
             )
             for note in notes:
                 self._append_locked(f"launcher: {note}")
+            if self.log_file is not None:
+                self._append_locked(f"launcher: this run's output is also written to {self.log_file}")
             try:
                 process = subprocess.Popen(
                     argv,
@@ -1387,13 +1812,14 @@ class Runtime:
                     start_new_session=True,
                 )
             except OSError as exc:
-                self._append_locked(f"Failed to start {engine}: {exc}")
+                self._note_locked(f"Failed to start {engine}: {exc}")
+                self._close_run_log_locked()
                 raise HTTPException(status_code=500, detail=str(exc)) from exc
             self.process = process
             self.spec = spec
             self.command = argv
             self.started_at = time.time()
-            self._append_locked(f"Started {engine} pid={process.pid}")
+            self._note_locked(f"Started {engine} pid={process.pid}")
         threading.Thread(target=self._pump, args=(process,), daemon=True).start()
         threading.Thread(target=self._ram_watchdog, args=(process, engine), daemon=True).start()
         return self.status()
@@ -1411,22 +1837,64 @@ class Runtime:
                 if process is self.process:
                     engine = self.spec.engine if self.spec else "engine"
                     if code == -signal.SIGKILL:
-                        self._append_locked(
-                            f"{engine} was SIGKILLed (exit {code}) - by the RAM watchdog, Stop, "
-                            "or the kernel OOM killer."
-                        )
+                        self._note_locked(f"{engine} exited with SIGKILL: {self._explain_sigkill_locked(engine)}")
                     else:
-                        self._append_locked(f"{engine} exited with code {code}")
+                        self._note_locked(f"{engine} exited with code {code}")
+                    self._close_run_log_locked()
+
+    def _explain_sigkill_locked(self, engine: str) -> str:
+        """Exit -9 has four very different causes; the log line has to name the right one."""
+        if self._kill_reason:
+            return self._kill_reason
+        cg = _cgroup_memory()
+        before, now = self._oom_kills_at_start, cg.get("oom_kills")
+        if before is not None and now is not None and now > before:
+            cap = cg.get("max_bytes")
+            return (
+                f"the kernel OOM killer fired inside the launcher's cgroup ({now - before}x, "
+                f"memory.max={cap / GIB:.0f} GiB) - the engine's host RAM outgrew the cap. "
+                "Lower MAX_JOBS via the env box, close other programs, or raise the unit's MemoryMax."
+                if cap else
+                f"the kernel OOM killer fired inside the launcher's cgroup ({now - before}x)."
+            )
+        if engine == "sglang":
+            return (
+                "not the launcher. SGLang SIGKILLs its own process tree after a fatal error in a "
+                "worker - the traceback above is the actual cause."
+            )
+        return "not the launcher; killed externally or by the kernel (check `journalctl -k`)."
 
     def _ram_watchdog(self, process: subprocess.Popen, engine: str):
         """Kill the engine's whole process group before host RAM runs out. SIGKILL rather than
         SIGTERM: a thrashing box cannot afford a graceful shutdown, and the killed processes'
-        anonymous memory is released immediately."""
+        anonymous memory is released immediately. The same loop reports kernel JIT builds,
+        which are what the engine is silently doing whenever RAM climbs during a load."""
         psi_strikes = 0
+        swap_warned = False
+        ticks = 0
         while process.poll() is None:
             time.sleep(0.5)
+            ticks += 1
+            if ticks % 4 == 0:
+                self._track_jit(process)
             ram = ram_snapshot()
             available, psi = ram["available_bytes"], ram["psi_full_avg10"]
+            swap_total, swap_free = ram["swap_total_bytes"], ram["swap_free_bytes"]
+            if (
+                not swap_warned and swap_total and swap_free is not None
+                and swap_free < 0.1 * swap_total
+            ):
+                # Not a kill: the kernel has pushed idle programs out to make room, which is
+                # exactly what makes the desktop feel frozen. Say why while it is happening.
+                swap_warned = True
+                with self.lock:
+                    if process is self.process:
+                        self._note_locked(
+                            f"RAM WATCHDOG: swap is {100 * (1 - swap_free / swap_total):.0f}% full "
+                            f"({(swap_total - swap_free) / GIB:.1f} GiB); the host is under memory "
+                            "pressure and other programs are being swapped out. Largest users: "
+                            + (", ".join(top_ram_consumers()) or "n/a") + "."
+                        )
             reason = None
             if available is not None and available < RAM_KILL_GIB * GIB:
                 reason = f"host RAM critically low ({available / GIB:.2f} GiB available)"
@@ -1441,13 +1909,50 @@ class Runtime:
             with self.lock:
                 if process is not self.process:
                     return
-                self._append_locked(
+                self._kill_reason = f"RAM watchdog ({reason})"
+                self._note_locked(
                     f"RAM WATCHDOG: {reason}; SIGKILLing the {engine} process group to keep the "
                     "host alive. If this was kernel JIT, retry - finished objects are cached and "
-                    "MAX_JOBS is sized from free RAM at each launch."
+                    "MAX_JOBS is sized from the RAM budget at each launch."
                 )
             _kill_group(process, signal.SIGKILL)
             return
+
+    def _track_jit(self, process: subprocess.Popen) -> None:
+        try:
+            current = jit_progress(process.pid)  # start_new_session=True: session id == pid
+        except OSError:
+            return
+        with self.lock:
+            if process is not self.process:
+                return
+            previous = self._jit
+            self._jit = current
+            if current is None:
+                if previous is not None:
+                    self._note_locked(
+                        f"kernel JIT finished: {previous['op']} "
+                        f"({previous['done']}/{previous['total']} steps, {_fmt_duration(previous['elapsed_s'])}); "
+                        "cached for later starts."
+                    )
+                return
+            if previous is None or previous["op"] != current["op"]:
+                self._note_locked(
+                    f"kernel JIT started: {current['op']} - {current['total']} compile steps, "
+                    f"{self._max_jobs} at a time (MAX_JOBS). The engine's own output stays quiet until "
+                    "this finishes; each step is cached, so a retry resumes where it stopped."
+                )
+                return
+            if current["done"] != previous["done"] and current["total"]:
+                remaining = ""
+                if current["avg_step_s"]:
+                    left = (current["total"] - current["done"]) * current["avg_step_s"] / max(1, self._max_jobs)
+                    remaining = f", about {_fmt_duration(left)} left"
+                self._note_locked(
+                    f"kernel JIT {current['op']}: {current['done']}/{current['total']} steps"
+                    + (f", ~{current['avg_step_s']:.0f} s per step" if current["avg_step_s"] else "")
+                    + f", {current['compilers']} compiler process(es) running{remaining}."
+                )
 
     def stop(self) -> dict:
         with self.lock:
@@ -1455,6 +1960,7 @@ class Runtime:
             process = self.process
             owned = bool(process and process.poll() is None)
             if owned:
+                self._kill_reason = "Stop requested from the launcher"
                 self._append_locked(f"Stopping {engine} pid={process.pid} (SIGTERM)...")
         if not owned:
             current = self.status()
@@ -1466,10 +1972,7 @@ class Runtime:
             else:
                 self.log("No server process is running.")
             return current
-        try:
-            pgid = os.getpgid(process.pid)
-        except (OSError, ProcessLookupError):
-            pgid = None
+        sid = process.pid  # start_new_session=True: the engine leads its own session
         _kill_group(process, signal.SIGTERM)
         try:
             process.wait(timeout=30)
@@ -1481,14 +1984,11 @@ class Runtime:
             except subprocess.TimeoutExpired:
                 self.log("Main process did not exit after SIGKILL.")
         # The main pid exiting is not the end: SGLang's scheduler/detokenizer workers and
-        # vLLM's engine-core processes live in the same group and are what hold GPU memory.
-        if pgid is not None and not _wait_group_gone(pgid, timeout=20):
-            self.log("Worker processes are still alive; SIGKILLing the process group...")
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-            if not _wait_group_gone(pgid, timeout=10):
+        # vLLM's engine-core processes live in the same session and are what hold GPU memory.
+        if not _wait_group_gone(sid, timeout=20):
+            self.log("Worker processes are still alive; SIGKILLing the whole session...")
+            _kill_group(process, signal.SIGKILL)
+            if not _wait_group_gone(sid, timeout=10):
                 self.log("Some worker processes could not be killed; GPU memory may still be held.")
         return self.status()
 
@@ -1505,6 +2005,8 @@ class Runtime:
             "model": self.spec.model if self.spec else None,
             "port": self.spec.port if self.spec else None,
             "command": self.command,
+            "log_file": str(self.log_file) if self.log_file else None,
+            "jit": self._jit if running else None,
         }
 
     def status(self) -> dict:
@@ -1519,10 +2021,15 @@ class Runtime:
             snapshot["external"] = False
             return snapshot
 
-        # Nothing of ours is up, so adopt whatever else is serving the shared port. This keeps
-        # the status pill, chat proxy and delete guard honest about a model another manager
-        # launched.
-        endpoint = self._probe(EXTERNAL_PORT, EXTERNAL_API_KEY)
+        # Nothing of ours is up, so adopt whatever else is serving one of the shared ports.
+        # This keeps the status pill, chat proxy and delete guard honest about a model
+        # another manager launched.
+        endpoint, port = {"online": False, "models": [], "error": None}, EXTERNAL_PORT
+        for candidate in EXTERNAL_PORTS:
+            probed = self._probe(candidate, EXTERNAL_API_KEY)
+            if probed["online"]:
+                endpoint, port = probed, candidate
+                break
         snapshot["endpoint"] = endpoint
         snapshot["owned"] = False
         snapshot["external"] = endpoint["online"]
@@ -1530,11 +2037,11 @@ class Runtime:
             snapshot.update(
                 {
                     "running": True,
-                    "engine": None,  # unknown: any OpenAI-compatible server
+                    "engine": self._external_engine(port, EXTERNAL_API_KEY),
                     "pid": None,
                     "returncode": None,
                     "uptime": None,
-                    "port": EXTERNAL_PORT,
+                    "port": port,
                     "model": (endpoint["models"] or [None])[0],
                     "command": [],
                 }
@@ -1544,14 +2051,36 @@ class Runtime:
             if endpoint["online"] and not self.adopted:
                 self.adopted = True
                 self._append_locked(
-                    f"Adopted an external OpenAI-compatible server on port {EXTERNAL_PORT} serving "
-                    f"{', '.join(endpoint['models']) or 'an unknown model'}. It was started "
-                    "outside this launcher, so no log output is available here and Stop is "
-                    f"disabled. Manage it where it was started ({EXTERNAL_NAME})."
+                    f"Adopted an external {snapshot['engine'] or 'OpenAI-compatible'} server on "
+                    f"port {port} serving {', '.join(endpoint['models']) or 'an unknown model'}. "
+                    "It was started outside this launcher, so no log output is available here "
+                    f"and Stop is disabled. Manage it where it was started ({EXTERNAL_NAME})."
                 )
             elif not endpoint["online"]:
                 self.adopted = False
+                self._external_engines.clear()
         return snapshot
+
+    def _external_engine(self, port: int, api_key: str | None) -> str | None:
+        """Which engine an adopted server is, from endpoints only one of them has: vLLM
+        answers /version, SGLang answers /get_model_info. Cached while it stays online."""
+        if port in self._external_engines:
+            return self._external_engines[port]
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        engine = None
+        for path, key, name in (("/get_model_info", "model_path", "sglang"), ("/version", "version", "vllm")):
+            try:
+                response = httpx.get(
+                    f"http://127.0.0.1:{port}{path}", headers=headers,
+                    timeout=httpx.Timeout(1.5, connect=0.4),
+                )
+                if response.status_code == 200 and key in response.json():
+                    engine = name
+                    break
+            except (httpx.HTTPError, ValueError):
+                continue
+        self._external_engines[port] = engine
+        return engine
 
     @staticmethod
     def _probe(port: int, api_key: str | None) -> dict:
@@ -1570,26 +2099,47 @@ class Runtime:
 
 
 def _kill_group(process: subprocess.Popen, sig: int) -> None:
+    """Signal the engine's whole *session*: the leader's process group plus every process
+    that re-grouped itself (ninja does this for each nvcc/cicc job, and those are the 6 GiB
+    processes a RAM kill exists to remove)."""
+    pids = {p["pid"] for p in _session_processes(process.pid)}
     try:
         os.killpg(os.getpgid(process.pid), sig)
     except (OSError, ProcessLookupError):
-        # Group already gone (or the leader was reaped): signal the pid as a fallback.
+        pass
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (OSError, ProcessLookupError):
+            pass
+    if not pids:
         try:
             process.send_signal(sig)
         except (OSError, ProcessLookupError):
             pass
 
 
-def _wait_group_gone(pgid: int, timeout: float) -> bool:
-    """True once no process in the group exists (signal 0 probes without delivering)."""
+def _fmt_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60:02d} s"
+    return f"{seconds // 3600} h {(seconds % 3600) // 60:02d} min"
+
+
+def _wait_group_gone(sid: int, timeout: float) -> bool:
+    """True once no process of the engine's session exists (leader, workers, compile jobs)."""
     deadline = time.monotonic() + timeout
     while True:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return True
-        except PermissionError:
-            pass  # exists but not ours: treat as alive
+        alive = _session_processes(sid)
+        if not alive:
+            try:
+                os.killpg(sid, 0)  # session leader's group, in case /proc was unreadable
+            except ProcessLookupError:
+                return True
+            except PermissionError:
+                pass
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.25)
@@ -1805,12 +2355,87 @@ _background_tasks: set = set()
 
 
 async def _abort_upstream(port: int, headers: dict[str, str], rid: str) -> None:
-    """SGLang keeps generating after the client hangs up; ask it to drop the request."""
+    """Ask SGLang to drop a request. Must reach it while the streaming connection for that
+    request is still open: on client disconnect SGLang discards the request's state without
+    aborting the scheduler, after which an abort for that rid is ignored and decoding runs
+    on to max_tokens."""
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             await client.post(f"http://127.0.0.1:{port}/abort_request", json={"rid": rid}, headers=headers)
     except httpx.HTTPError:
         pass
+
+
+async def _pump_upstream(
+    url: str, payload: dict, headers: dict[str, str], engine: str | None, port: int,
+    queue: "asyncio.Queue[str | None]", stop: asyncio.Event,
+) -> None:
+    """Read the engine's SSE stream in a task of its own. The browser disconnecting cancels
+    the response generator; had that cancellation landed inside the httpx read, httpcore
+    would close the upstream socket immediately and SGLang would drop the request *without*
+    aborting it. Here the generator only sets `stop`; this task sends the abort while the
+    socket is still open, then closes it."""
+    rid = ""
+    done = False
+    stop_wait = asyncio.ensure_future(stop.wait())
+    next_line: asyncio.Future | None = None
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=10)) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as response:
+                if response.status_code != 200:
+                    detail = _upstream_error(response.status_code, await response.aread())
+                    await queue.put(f"data: {json.dumps({'error': detail})}\n\n")
+                    return
+                lines = response.aiter_lines()
+                while not done:
+                    next_line = asyncio.ensure_future(lines.__anext__())
+                    # SGLang can only abort a request it has already named: after Stop, keep
+                    # reading (bounded) until the first chunk carries the id.
+                    need_rid = stop.is_set() and engine == "sglang" and not rid
+                    await asyncio.wait(
+                        {next_line} if need_rid else {next_line, stop_wait},
+                        timeout=30 if need_rid else None,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not next_line.done():
+                        if engine == "sglang" and rid:
+                            await _abort_upstream(port, headers, rid)
+                        # Cancelling the read closes the socket (httpcore); vLLM aborts on that.
+                        next_line.cancel()
+                        await asyncio.gather(next_line, return_exceptions=True)
+                        next_line = None
+                        break
+                    try:
+                        line = next_line.result()
+                    except StopAsyncIteration:
+                        break
+                    next_line = None
+                    if not line:
+                        continue
+                    if not rid and line.startswith("data: "):
+                        body = line[6:].strip()
+                        if body and body != "[DONE]":
+                            try:
+                                rid = json.loads(body).get("id") or ""
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+                    if line.strip() == "data: [DONE]":
+                        done = True
+                    if not stop.is_set():
+                        await queue.put(f"{line}\n\n")
+                    elif not done:
+                        if engine == "sglang" and rid:
+                            await _abort_upstream(port, headers, rid)
+                        break  # leaving the context closes the socket
+    except httpx.HTTPError as exc:
+        await queue.put(f"data: {json.dumps({'error': str(exc)})}\n\n")
+    finally:
+        for fut in (next_line, stop_wait):
+            if fut is not None and not fut.done():
+                fut.cancel()
+        if next_line is not None:
+            await asyncio.gather(next_line, return_exceptions=True)
+        await queue.put(None)
 
 
 @app.post("/api/chat")
@@ -1823,6 +2448,8 @@ async def api_chat(req: ChatRequest, request: Request):
     models = status.get("endpoint", {}).get("models") or []
     if not models:
         raise HTTPException(status_code=409, detail="The model is still loading")
+    if not any(m.get("role") != "system" for m in req.messages):
+        raise HTTPException(status_code=400, detail="Chat history has no user message to send")
 
     payload: dict[str, Any] = {"model": models[0], "messages": req.messages, "stream": req.stream}
     for key in (
@@ -1851,7 +2478,9 @@ async def api_chat(req: ChatRequest, request: Request):
 
     with runtime.lock:
         owned_key = runtime.spec.api_key if runtime.spec else None
-        engine = runtime.spec.engine if runtime.spec else None
+    # status() names the engine for both a process we launched and an adopted external one;
+    # the port likewise follows whichever server is actually up (vLLM 8000, SGLang 30000...).
+    engine = status.get("engine")
     port = status["port"]
     api_key = owned_key if status.get("owned") else EXTERNAL_API_KEY
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -1874,40 +2503,26 @@ async def api_chat(req: ChatRequest, request: Request):
             raise HTTPException(status_code=502, detail="Engine returned a non-JSON response") from exc
 
     async def relay() -> AsyncIterator[str]:
-        rid = ""
-        done = False
+        # Starlette cancels this generator when the browser disconnects (Stop). The upstream
+        # read lives in _pump_upstream so that cancellation never lands inside httpx: only
+        # `stop` is set here, and the pump aborts the engine request before closing.
+        queue: asyncio.Queue[str | None] = asyncio.Queue()
+        stop = asyncio.Event()
+        pump = asyncio.get_running_loop().create_task(
+            _pump_upstream(url, payload, headers, engine, port, queue, stop)
+        )
+        _background_tasks.add(pump)
+        pump.add_done_callback(_background_tasks.discard)
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=10)) as client:
-                async with client.stream("POST", url, json=payload, headers=headers) as response:
-                    if response.status_code != 200:
-                        detail = _upstream_error(response.status_code, await response.aread())
-                        yield f"data: {json.dumps({'error': detail})}\n\n"
-                        return
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        if not rid and line.startswith("data: "):
-                            body = line[6:].strip()
-                            if body and body != "[DONE]":
-                                try:
-                                    rid = json.loads(body).get("id") or ""
-                                except (json.JSONDecodeError, AttributeError):
-                                    pass
-                        if line.strip() == "data: [DONE]":
-                            done = True
-                        yield f"{line}\n\n"
-                        if not done and await request.is_disconnected():
-                            break
-        except httpx.HTTPError as exc:
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            while True:
+                item = await queue.get()
+                if item is None:
+                    break
+                yield item
+                if await request.is_disconnected():
+                    break
         finally:
-            # Starlette cancels this generator when the browser disconnects, so an await
-            # here would itself be cancelled: hand the abort to a detached task instead.
-            # (vLLM aborts on its own once the upstream socket closes.)
-            if engine == "sglang" and rid and not done:
-                task = asyncio.get_running_loop().create_task(_abort_upstream(port, headers, rid))
-                _background_tasks.add(task)
-                task.add_done_callback(_background_tasks.discard)
+            stop.set()
 
     return StreamingResponse(
         relay(),

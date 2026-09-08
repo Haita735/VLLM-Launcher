@@ -9,6 +9,9 @@ venv/
 presets/
 profiles/
 
+# Notes about hand-patches to this machine's engine environments - not part of the launcher
+LOCAL-PATCHES.md
+
 # Logs / scratch
 *.log
 nohup.out

@@ -179,8 +179,8 @@
           </label>
         </details>
 
-        <!-- SGLang-only knobs; hidden until Engine == SGLang. Flag names/values
-             match `sglang.launch_server --help` from the installed 0.5.18. -->
+        <!-- SGLang-only knobs; hidden until Engine == SGLang. Flag names/values follow
+             `python -m sglang.launch_server --help` (SGLang 0.5.x). -->
         <div class="engine-block" data-engine="sglang" hidden>
         <details>
           <summary>SGLang</summary>
@@ -188,9 +188,9 @@
             Shared fields above (dtype, quantization, TP/PP, max-model-len → context-length,
             max-num-seqs → max-running-requests, GPU-memory-util → mem-fraction-static,
             KV-cache-dtype, attention-backend, trust-remote-code, reasoning-parser)
-            carry over to SGLang's equivalent flags automatically. Values that only
-            exist in one engine (e.g. vLLM's <code>FLASH_ATTN</code> vs SGLang's
-            <code>fa3</code>) need to be switched manually.
+            carry over to SGLang's equivalent flags automatically. Well-known vLLM-only
+            values (e.g. <code>FLASH_ATTN</code> → <code>fa3</code>, <code>kv-cache-dtype fp8</code>
+            → <code>fp8_e4m3</code>) are translated; the command preview lists every translation.
           </p>
           <div class="grid">
             <label>Load format
@@ -243,10 +243,10 @@
         <details>
           <summary>SGLang · Speculative / MTP</summary>
           <p class="muted-text" style="margin-bottom:8px">
-            For NEXTN (MTP) checkpoints like unsloth/Qwen3.8-27B-NVFP4 the
-            draft heads are inside the main safetensors, so <code>Draft model</code>
-            is only needed for an external draft. Leave <code>Top-k</code> empty
-            (or 1) for MTP; it becomes &gt;1 when using an EAGLE-class draft model.
+            For checkpoints that ship their own MTP heads (NEXTN) the draft weights are
+            inside the main safetensors, so <code>Draft model</code> is only needed for an
+            external draft. Leave <code>Top-k</code> empty (or 1) for MTP; it becomes
+            &gt;1 when using an EAGLE-class draft model.
           </p>
           <div class="grid">
             <label>Algorithm
@@ -297,7 +297,7 @@
       </div>
       <div class="config-body">
         <label class="wide-plain">Model URL or repo id
-          <input id="dl-repo" placeholder="https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4  or  unsloth/Qwen3.8-27B-NVFP4" />
+          <input id="dl-repo" placeholder="https://huggingface.co/<org>/<model>  or  <org>/<model>" />
         </label>
         <div class="resolved" id="dl-resolved"></div>
         <div class="grid">

@@ -1,15 +1,18 @@
-"""Transparent logging proxy for debugging what a client actually sends to vLLM.
+"""Transparent logging proxy for debugging what a client actually sends to an engine.
 
-Listens on :8001 and forwards to :8000, dumping each request/response to stdout.
+Usage: python tools/logging_proxy.py [listen_port] [upstream_url]
+Defaults: listens on :8001 and forwards to http://127.0.0.1:8000 (override with the second
+argument or UPSTREAM=...), dumping each request/response to stdout.
 """
 
 import json
+import os
 import sys
 import time
 
 from aiohttp import ClientSession, ClientTimeout, web
 
-UPSTREAM = "http://127.0.0.1:8000"
+UPSTREAM = (sys.argv[2] if len(sys.argv) > 2 else os.environ.get("UPSTREAM", "http://127.0.0.1:8000")).rstrip("/")
 REDACT = {"authorization", "api-key", "x-api-key", "cookie"}
 
 

@@ -107,10 +107,15 @@ function ramCard(ram) {
     ? ` · swap ${fmtBytes(ram.swap_total_bytes - (ram.swap_free_bytes ?? 0))}/${fmtBytes(ram.swap_total_bytes)}`
     : '';
   const psi = ram.psi_full_avg10 != null && ram.psi_full_avg10 >= 1 ? ` · stall ${ram.psi_full_avg10.toFixed(0)}%` : '';
-  return `<div class="gpu-card ram-card${low ? ' low' : ''}" title="Launch refuses below ${guard.min_free_gib ?? '?'} GiB free; the watchdog kills the engine below ${guard.kill_gib ?? '?'} GiB">
+  // A systemd/Docker memory cap on the launcher applies to the engine too and is usually
+  // the tighter bound, so show it next to the host figure.
+  const cg = ram.cgroup || {};
+  const cap = cg.high_bytes ?? cg.max_bytes;
+  const cgroup = cap ? ` · cgroup ${fmtBytes(cg.anon_bytes ?? cg.current_bytes ?? 0)}/${fmtBytes(cap)}` : '';
+  return `<div class="gpu-card ram-card${low ? ' low' : ''}" title="Launch refuses below ${guard.min_free_gib ?? '?'} GiB free; the watchdog kills the engine below ${guard.kill_gib ?? '?'} GiB${cap ? `. The launcher's cgroup is capped at ${fmtBytes(cg.max_bytes || cap)} (throttled above ${fmtBytes(cap)}); the engine inherits that cap.` : ''}">
     <div class="gpu-name"><span>Host RAM</span><span>${low ? 'low for launch' : `${avail.toFixed(1)} GiB free`}</span></div>
     <div class="bar"><span style="width:${pct}%"></span></div>
-    <div class="gpu-meta">${fmtBytes(used)} / ${fmtBytes(ram.total_bytes)}${swap}${psi}</div>
+    <div class="gpu-meta">${fmtBytes(used)} / ${fmtBytes(ram.total_bytes)}${swap}${cgroup}${psi}</div>
   </div>`;
 }
 
@@ -306,7 +311,8 @@ function applySuggestedDefaults(model) {
   if (!$('f-dtype').value && cap < 80 && (model.dtype || '').toLowerCase() === 'bfloat16') {
     $('f-dtype').value = 'float16';
   }
-  if (!$('f-linear_backend').value && cap < 100 && /nvfp4|fp4/.test(quant)) {
+  // linear-backend is a vLLM flag (SGLang ignores it, and the preview would say so).
+  if (!$('f-linear_backend').value && cap < 100 && /nvfp4|fp4/.test(quant) && $('f-engine').value !== 'sglang') {
     $('f-linear_backend').value = 'marlin';
   }
   if (!$('f-tensor_parallel_size').value && (state.system?.gpu_count || 1) > 1) {
@@ -413,7 +419,7 @@ async function refreshPreview() {
     $('cmd-preview').textContent = envLine ? `${envLine} \\\n  ${command}` : command;
     // Flag translations, dropped fields and the RAM-derived JIT sizing the server applied.
     $('preview-notes').innerHTML = (notes || [])
-      .map((n) => `<div class="note ${/ignored|dropped|no equivalent/i.test(n) ? 'warn' : 'info'}">${esc(n)}</div>`).join('');
+      .map((n) => `<div class="note ${/ignored|dropped|no equivalent|warning|exceeds/i.test(n) ? 'warn' : 'info'}">${esc(n)}</div>`).join('');
   } catch (err) {
     $('cmd-preview').textContent = `# ${err.message}`;
     $('preview-notes').innerHTML = '';
@@ -429,13 +435,20 @@ function setStatus(status) {
   const external = !!status.external;
   pill.className = 'pill';
   const engineTag = status.engine ? ` · ${status.engine}` : '';
+  // A kernel JIT build is the one loading phase where the engine prints nothing for
+  // many minutes; name it in the pill so the page never looks hung.
+  const jit = status.jit;
+  const jitTag = jit ? ` · compiling kernels ${jit.done}/${jit.total}` : '';
   if (status.running && online) {
     pill.classList.add('running');
     pill.textContent = external ? `serving · external${engineTag}` : `serving${engineTag}`;
   }
-  else if (status.running) { pill.classList.add('starting'); pill.textContent = `loading${engineTag}`; }
+  else if (status.running) { pill.classList.add('starting'); pill.textContent = `loading${engineTag}${jitTag}`; }
   else if (status.returncode) { pill.classList.add('error'); pill.textContent = `exit ${status.returncode}`; }
   else { pill.textContent = 'idle'; }
+  pill.title = jit
+    ? `${jit.op}: ${jit.done}/${jit.total} compile steps, ${jit.compilers} compiler process(es), ${Math.round(jit.elapsed_s / 60)} min so far. One-time; results are cached.`
+    : '';
 
   const owner = external ? 'not owned by launcher' : `pid ${status.pid}`;
   $('endpoint-label').textContent = status.running
@@ -449,7 +462,15 @@ function setStatus(status) {
     ? 'Started outside this launcher - stop it from wherever it was launched.'
     : '';
   const models = status.endpoint?.models || [];
-  $('chat-model').textContent = status.running ? (models[0] || 'model loading…') : 'no model loaded';
+  $('chat-model').textContent = chatTarget(status, models);
+}
+
+// "model · engine · :port" so it is obvious which server the chat proxy will hit.
+function chatTarget(status, models) {
+  if (!status.running) return 'no model loaded';
+  const where = [status.engine || (status.external ? 'external' : null), status.port ? `:${status.port}` : null]
+    .filter(Boolean).join(' · ');
+  return `${models[0] || 'model loading…'}${where ? ` · ${where}` : ''}`;
 }
 
 async function pollStatus() {
@@ -641,10 +662,7 @@ async function streamDownloadLogs() {
 async function refreshChatModel() {
   try {
     const status = await api('/api/status');
-    const models = status.endpoint?.models || [];
-    $('chat-model').textContent = status.running
-      ? (models[0] || 'model loading…')
-      : 'no model loaded';
+    $('chat-model').textContent = chatTarget(status, status.endpoint?.models || []);
   } catch (_) { /* transient */ }
 }
 
@@ -719,9 +737,12 @@ function renderChat() {
     // While only reasoning has arrived, the disclosure itself is the progress indicator.
     const hideBubble = m.pending && !m.content && m.reasoning;
     const stopped = m.stopped ? '<span class="muted-text"> [stopped]</span>' : '';
+    // finish_reason=length means the engine hit max_tokens mid-answer (thinking models spend
+    // the budget reasoning first); without this the truncated reply reads as a bad model.
+    const truncated = m.finishReason === 'length' ? '<span class="muted-text"> [cut off: max tokens reached - raise Max tokens]</span>' : '';
     const bubble = hideBubble
       ? ''
-      : `<div class="bubble">${body}${m.pending ? '<span class="cursor-blink">▋</span>' : stopped}</div>`;
+      : `<div class="bubble">${body}${m.pending ? '<span class="cursor-blink">▋</span>' : stopped + truncated}</div>`;
     return `<div class="msg ${m.role}${m.error ? ' error' : ''}">
       <span class="who">${m.role}</span>
       ${thinkBlock(m, i)}
@@ -756,11 +777,23 @@ function buildMessages() {
   const messages = [];
   const system = $('chat-system').value.trim();
   if (system) messages.push({ role: 'system', content: system });
-  // Errors and empty (stopped-before-first-token) assistant turns would either be
-  // rejected by the engine or confuse the model, so they stay out of the history.
-  state.chat.filter((m) => !m.error && (m.role !== 'assistant' || m.content.trim())).forEach((m) => {
-    messages.push({ role: m.role, content: m.content });
-  });
+  const turns = state.chat;
+  for (let i = 0; i < turns.length; i++) {
+    const m = turns[i];
+    if (m.role === 'user') {
+      // A question whose answer never arrived (error, or stopped before the first token)
+      // would leave two user turns back to back; drop the pair. The pending placeholder
+      // after the newest question is not an answer yet, so that one stays.
+      const reply = turns[i + 1];
+      if (reply && reply.role === 'assistant' && !reply.pending && (reply.error || !reply.content.trim())) {
+        i += 1;
+        continue;
+      }
+      messages.push({ role: 'user', content: m.content });
+    } else if (m.role === 'assistant' && !m.error && m.content.trim()) {
+      messages.push({ role: 'assistant', content: m.content });
+    }
+  }
   return messages;
 }
 
@@ -810,10 +843,13 @@ async function sendChat(reuseLast = false) {
   };
 
   try {
+    // buildMessages() already leaves out the pending (empty) assistant placeholder, so the
+    // history ends with the newest user turn. Slicing the last entry off here used to drop
+    // that user message instead -> "Messages cannot be empty" on the first send.
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: buildMessages().slice(0, -1), ...params }),
+      body: JSON.stringify({ messages: buildMessages(), ...params }),
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(await readError(res));
@@ -830,6 +866,7 @@ async function sendChat(reuseLast = false) {
       }
       assistant.raw = msg.content || '';
       applyContent();
+      assistant.finishReason = data.choices[0].finish_reason || null;
       if (!assistant.thinkPinned) assistant.thinkOpen = false;
       tokens = data.usage?.completion_tokens || 0;
     } else {
@@ -849,7 +886,9 @@ async function sendChat(reuseLast = false) {
           let json;
           try { json = JSON.parse(payload); } catch (_) { continue; }
           if (json.error) throw new Error(errorText(json.error));
-          const delta = json.choices?.[0]?.delta || {};
+          const choice = json.choices?.[0] || {};
+          const delta = choice.delta || {};
+          if (choice.finish_reason) assistant.finishReason = choice.finish_reason;
           // vLLM 0.26 streams `reasoning`; SGLang and older builds use `reasoning_content`.
           const think = delta.reasoning ?? delta.reasoning_content;
           if (think) {
