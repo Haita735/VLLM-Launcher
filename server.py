@@ -81,7 +81,11 @@ def _env_has_module(python: Path, module: str) -> bool:
             return importlib.util.find_spec(module) is not None
         except (ImportError, ValueError):
             return False
-    return any((site / module).is_dir() for site in _site_packages(python))
+    # `pip install -e` leaves only a finder .pth in site-packages; the package sits elsewhere.
+    return any(
+        (site / module).is_dir() or any(site.glob(f"__editable__.{module}-*.pth"))
+        for site in _site_packages(python)
+    )
 
 
 def _python_for_script(script: Path) -> Path | None:
@@ -274,7 +278,14 @@ def _env_float(name: str, default: float) -> float:
 #      RAM_KILL_GIB or the kernel reports the system fully stalled on memory (PSI).
 MIN_FREE_RAM_GIB = _env_float("VLLM_LAUNCHER_MIN_FREE_RAM_GIB", 4.0)
 RAM_KILL_GIB = _env_float("VLLM_LAUNCHER_RAM_KILL_GIB", 2.0)
-RAM_PSI_FULL_KILL = _env_float("VLLM_LAUNCHER_RAM_PSI_FULL", 25.0)  # % of last 10 s stalled
+# PSI `full avg10` (% of the last 10 s the whole host was stalled on memory) that trips the
+# watchdog. With a discrete GPU the weights go to VRAM and host memory stays quiet, so 25 % is
+# already a thrashing desktop. On unified-memory parts (GB10 / DGX Spark) the model *is* host
+# memory: faulting 100+ GiB of weights in stalls the box 25-30 % of the time while it is
+# perfectly healthy, so the default moves up and the MemAvailable floor stays the real OOM
+# backstop. VLLM_LAUNCHER_RAM_PSI_FULL overrides either; see ram_psi_full_kill().
+RAM_PSI_FULL_KILL_DISCRETE = 25.0
+RAM_PSI_FULL_KILL_UNIFIED = 80.0
 JIT_RAM_PER_JOB_GIB = _env_float("VLLM_LAUNCHER_JIT_RAM_PER_JOB_GIB", 6.0)
 # Measured: SGLang's scheduler + tokenizer + detokenizer sit at ~6 GiB of anonymous memory
 # while a model loads; vLLM's engine core is similar. The JIT budget is what is left after that.
@@ -485,6 +496,18 @@ async def restrict_to_private_networks(request: Request, call_next):
 # --------------------------------------------------------------------------------------
 # Hardware probe
 # --------------------------------------------------------------------------------------
+# Grace Blackwell superchips (GB10: DGX Spark, ASUS GX10, ...) have no dedicated VRAM - CPU and
+# GPU share one LPDDR5X pool - and nvidia-smi prints "[N/A]" for every memory field.
+_UNIFIED_MEMORY_GPU_RE = re.compile(r"\bGB10\b")
+
+
+def _smi_int(value: str) -> int | None:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None  # nvidia-smi's "[N/A]"
+
+
 def _nvidia_smi(fields: str) -> list[list[str]]:
     try:
         out = subprocess.run(
@@ -507,18 +530,38 @@ def gpu_snapshot() -> list[dict]:
     for row in rows:
         if len(row) < 7:
             continue
+        total = _smi_int(row[2])
         gpus.append(
             {
                 "index": int(row[0]),
                 "name": row[1],
-                "memory_total_mb": int(float(row[2])),
-                "memory_used_mb": int(float(row[3])),
-                "utilization": int(float(row[4])),
-                "temperature": int(float(row[5])),
+                "memory_total_mb": total or 0,
+                "memory_used_mb": _smi_int(row[3]) or 0,
+                "utilization": _smi_int(row[4]) or 0,
+                "temperature": _smi_int(row[5]) or 0,
                 "compute_cap": row[6],
+                # The model lives in host RAM on these parts: the RAM card and guards apply.
+                "unified_memory": total is None or bool(_UNIFIED_MEMORY_GPU_RE.search(row[1])),
             }
         )
     return gpus
+
+
+_unified_memory_host: bool | None = None
+
+
+def unified_memory_host() -> bool:
+    """True when the GPUs share the host's memory (GB10 class); probed once."""
+    global _unified_memory_host
+    if _unified_memory_host is None:
+        gpus = gpu_snapshot()
+        _unified_memory_host = bool(gpus) and all(g["unified_memory"] for g in gpus)
+    return _unified_memory_host
+
+
+def ram_psi_full_kill() -> float:
+    default = RAM_PSI_FULL_KILL_UNIFIED if unified_memory_host() else RAM_PSI_FULL_KILL_DISCRETE
+    return _env_float("VLLM_LAUNCHER_RAM_PSI_FULL", default)
 
 
 def _local_addresses() -> list[str]:
@@ -608,7 +651,7 @@ def system_info() -> dict:
                 versions["cuda"] = probed.get("cuda")
 
         gpus = gpu_snapshot()
-        caps = [g["compute_cap"] for g in gpus]
+        caps = [g["compute_cap"] for g in gpus if re.fullmatch(r"\d+\.\d+", g["compute_cap"])]
         cap_major_minor = min((tuple(int(x) for x in c.split(".")) for c in caps), default=(0, 0))
         _system_cache.update(
             {
@@ -618,6 +661,7 @@ def system_info() -> dict:
                 "capability": f"{cap_major_minor[0]}.{cap_major_minor[1]}" if caps else None,
                 "capability_int": cap_major_minor[0] * 10 + cap_major_minor[1],
                 "gpu_count": len(gpus),
+                "unified_memory": unified_memory_host(),
                 "external_port": EXTERNAL_PORT,
                 "hf_home": HF_HOME,
                 "hf_cli": shlex.join(_hf_cli()),
@@ -625,7 +669,7 @@ def system_info() -> dict:
                 "ram_guard": {
                     "min_free_gib": MIN_FREE_RAM_GIB,
                     "kill_gib": RAM_KILL_GIB,
-                    "psi_full_kill": RAM_PSI_FULL_KILL,
+                    "psi_full_kill": ram_psi_full_kill(),
                     "jit_ram_per_job_gib": JIT_RAM_PER_JOB_GIB,
                     "engine_reserve_gib": ENGINE_RAM_RESERVE_GIB,
                 },
@@ -1206,11 +1250,17 @@ def _jit_toolchain(cuda_root: Path, engine: Engine, env: dict[str, str]) -> list
     nvcc = _nvcc_version(cuda_root)
     headers = _cudart_header_version(cuda_root)
     define = "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK"
-    cudaflags = shlex.split(env.get("FLASHINFER_EXTRA_CUDAFLAGS", ""))
-    if nvcc and headers and nvcc != headers and define not in cudaflags:
-        cudaflags.append(define)
-        env["FLASHINFER_EXTRA_CUDAFLAGS"] = shlex.join(cudaflags)
-        notes.append(f"nvcc {nvcc} vs CUDA runtime headers {headers}: added {define} for JIT.")
+    if nvcc and headers and nvcc != headers:
+        # FlashInfer reads its own variable; NVCC_PREPEND_FLAGS is read by nvcc itself, so the
+        # define also reaches TileLang, tvm-ffi and torch cpp_extension builds.
+        for key in ("FLASHINFER_EXTRA_CUDAFLAGS", "NVCC_PREPEND_FLAGS"):
+            flags = shlex.split(env.get(key, ""))
+            if define not in flags:
+                env[key] = shlex.join(flags + [define])
+        notes.append(
+            f"nvcc {nvcc} vs CUDA runtime headers {headers}: added {define} for JIT "
+            "(FLASHINFER_EXTRA_CUDAFLAGS, NVCC_PREPEND_FLAGS)."
+        )
     return notes
 
 
@@ -1318,7 +1368,12 @@ def _resolve_env(spec: LaunchSpec, engine: Engine) -> tuple[dict[str, str], list
     consumers = top_ram_consumers()
     if consumers:
         notes.append("largest other RAM users: " + ", ".join(consumers) + ".")
-    notes.append(f"watchdog kills the engine below {RAM_KILL_GIB:g} GiB host RAM available.")
+    notes.append(
+        f"watchdog kills the engine below {RAM_KILL_GIB:g} GiB host RAM available or when the host "
+        f"is stalled on memory >= {ram_psi_full_kill():g}% of the time"
+        + (" (unified memory: the model is host RAM, so the stall trip point is raised)."
+           if unified_memory_host() else ".")
+    )
 
     for key, value in spec.env.items():
         if not _ENV_KEY_RE.match(key):
@@ -1870,6 +1925,7 @@ class Runtime:
         anonymous memory is released immediately. The same loop reports kernel JIT builds,
         which are what the engine is silently doing whenever RAM climbs during a load."""
         psi_strikes = 0
+        psi_kill = ram_psi_full_kill()
         swap_warned = False
         ticks = 0
         while process.poll() is None:
@@ -1898,7 +1954,7 @@ class Runtime:
             reason = None
             if available is not None and available < RAM_KILL_GIB * GIB:
                 reason = f"host RAM critically low ({available / GIB:.2f} GiB available)"
-            elif psi is not None and psi >= RAM_PSI_FULL_KILL:
+            elif psi is not None and psi >= psi_kill:
                 psi_strikes += 1
                 if psi_strikes >= 3:
                     reason = f"host stalled on memory ({psi:.0f}% of the last 10 s, PSI full avg10)"
@@ -2606,8 +2662,12 @@ def api_delete_models(body: dict):
 @app.post("/api/preview")
 def api_preview(spec: LaunchSpec):
     argv, env, notes = build_command(spec)
-    shown = ("CUDA_VISIBLE_DEVICES", "HF_HOME", "HF_HUB_OFFLINE", "CUDA_HOME", "MAX_JOBS")
+    shown = (
+        "CUDA_VISIBLE_DEVICES", "HF_HOME", "HF_HUB_OFFLINE", "CUDA_HOME", "MAX_JOBS",
+        "NVCC_PREPEND_FLAGS", "FLASHINFER_EXTRA_CUDAFLAGS", "FLASHINFER_DISABLE_VERSION_CHECK",
+    )
     overrides = {k: env[k] for k in shown if k in env}
+    overrides.update(spec.env)
     return {"command": shlex.join(argv), "argv": argv, "env": overrides, "notes": notes}
 
 

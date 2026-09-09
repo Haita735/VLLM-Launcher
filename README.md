@@ -381,7 +381,7 @@ All optional. Set them in the shell, the systemd unit, or its `EnvironmentFile`.
 | `VLLM_LAUNCHER_EXTERNAL_NAME` | generic wording | how messages refer to the other manager |
 | `VLLM_LAUNCHER_MIN_FREE_RAM_GIB` | `4` | refuse to launch below this much free host RAM |
 | `VLLM_LAUNCHER_RAM_KILL_GIB` | `2` | watchdog kills the engine below this |
-| `VLLM_LAUNCHER_RAM_PSI_FULL` | `25` | … or when memory PSI `full avg10` exceeds this % |
+| `VLLM_LAUNCHER_RAM_PSI_FULL` | `25` (`80` on unified memory) | … or when memory PSI `full avg10` exceeds this % |
 | `VLLM_LAUNCHER_JIT_RAM_PER_JOB_GIB` | `6` | RAM budgeted per parallel `nvcc` job |
 | `VLLM_LAUNCHER_ENGINE_RAM_RESERVE_GIB` | `6` | RAM reserved for the engine's own processes before sizing JIT |
 | `VLLM_LAUNCHER_JIT_MAX_JOBS` | `4` | hard cap on the derived `MAX_JOBS` |
@@ -409,7 +409,8 @@ Each engine is addressed by the **interpreter of the environment it is installed
 6. Common venv paths (`~/<name>/.venv`, `~/<name>-env`, `~/.venvs/<name>`, `/opt/<name>`, …).
 7. A `vllm` / `sglang` executable on `PATH`.
 
-A candidate counts only if the engine's package is actually importable from it. Engines that are
+A candidate counts only if the engine's package is actually importable from it (a regular
+install or a `pip install -e` editable one). Engines that are
 not found are shown as unavailable and refused at launch with a message naming the variable to
 set — never silently substituted with whatever `python` is on `PATH`. Versions are probed
 concurrently at startup inside each engine's own interpreter.
@@ -443,7 +444,9 @@ The launcher fixes this without modifying the environment: it maintains a direct
 on `LIBRARY_PATH` (honoured by gcc/clang for every `-l` lookup) and in
 `FLASHINFER_EXTRA_LDFLAGS`; `libcuda.so` comes from the driver package. When the toolkit's
 `nvcc` and its runtime headers have different versions (normal for independently versioned
-wheels), it adds `-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK`. Both are recorded in the launch notes.
+wheels), it adds `-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK` through `FLASHINFER_EXTRA_CUDAFLAGS`
+and `NVCC_PREPEND_FLAGS`, so the define also reaches JIT builders that drive `nvcc` themselves
+(TileLang, tvm-ffi, torch `cpp_extension`). Both are recorded in the launch notes.
 
 ### One config, two engines
 
@@ -561,6 +564,15 @@ through different kernels. The launcher's checkpoint notes cover these automatic
 - **FlashAttention 2 needs sm_80+**; attention falls back to Triton, which is fine.
 - **Hybrid linear-attention / Gated DeltaNet models** JIT their Triton kernels for whatever
   architecture is present; expect a longer first start.
+- **Unified memory (GB10: DGX Spark, ASUS GX10, sm_121)**: there is no VRAM - the GPU shares the
+  host's LPDDR5X and `nvidia-smi` reports every memory field as `[N/A]`. The launcher detects
+  this (the GPU card says *unified memory*, `/api/system` has `unified_memory: true`) and
+  reads the model's footprint from the Host RAM card instead. Because the weights *are* host
+  memory, faulting them in stalls the box 25-30 % of the time while it is perfectly healthy, so
+  the watchdog's PSI trip point defaults to 80 % there instead of 25 %; the `MemAvailable`
+  floor (`VLLM_LAUNCHER_RAM_KILL_GIB`) is unchanged and remains the real OOM backstop. Set
+  `VLLM_LAUNCHER_RAM_PSI_FULL` to override either default (`101` disables the PSI trip).
+  Discrete-GPU machines are unaffected.
 
 For reference, on 2× sm_75 cards a 35B-A3B NVFP4 MoE loaded in ~9.5 min the first time (JIT),
 ~4.5 min afterwards, and generated at 40–100 tok/s.

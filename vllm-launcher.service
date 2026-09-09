@@ -45,6 +45,10 @@ Environment="VLLM_LAUNCHER_ALLOWED_CIDRS=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,19
 #MemoryHigh=13G
 #MemoryMax=16G
 #MemorySwapMax=2G
+# Both engines pin host memory (CPU offload, swap space, NCCL/RDMA buffers) and their JIT
+# compilers recurse deeply; the same limits the official Docker images run with.
+LimitMEMLOCK=infinity
+LimitSTACK=67108864
 Restart=always
 RestartSec=5
 

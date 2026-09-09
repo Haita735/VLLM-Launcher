@@ -112,7 +112,7 @@ function ramCard(ram) {
   const cg = ram.cgroup || {};
   const cap = cg.high_bytes ?? cg.max_bytes;
   const cgroup = cap ? ` · cgroup ${fmtBytes(cg.anon_bytes ?? cg.current_bytes ?? 0)}/${fmtBytes(cap)}` : '';
-  return `<div class="gpu-card ram-card${low ? ' low' : ''}" title="Launch refuses below ${guard.min_free_gib ?? '?'} GiB free; the watchdog kills the engine below ${guard.kill_gib ?? '?'} GiB${cap ? `. The launcher's cgroup is capped at ${fmtBytes(cg.max_bytes || cap)} (throttled above ${fmtBytes(cap)}); the engine inherits that cap.` : ''}">
+  return `<div class="gpu-card ram-card${low ? ' low' : ''}" title="Launch refuses below ${guard.min_free_gib ?? '?'} GiB free; the watchdog kills the engine below ${guard.kill_gib ?? '?'} GiB or when the host is stalled on memory ${guard.psi_full_kill ?? '?'}% of the time${cap ? `. The launcher's cgroup is capped at ${fmtBytes(cg.max_bytes || cap)} (throttled above ${fmtBytes(cap)}); the engine inherits that cap.` : ''}">
     <div class="gpu-name"><span>Host RAM</span><span>${low ? 'low for launch' : `${avail.toFixed(1)} GiB free`}</span></div>
     <div class="bar"><span style="width:${pct}%"></span></div>
     <div class="gpu-meta">${fmtBytes(used)} / ${fmtBytes(ram.total_bytes)}${swap}${cgroup}${psi}</div>
@@ -122,10 +122,14 @@ function ramCard(ram) {
 function renderGpus(gpus, ram) {
   $('gpu-strip').innerHTML = gpus.map((g) => {
     const pct = g.memory_total_mb ? Math.round((g.memory_used_mb / g.memory_total_mb) * 100) : 0;
+    // Unified-memory parts (GB10) have no VRAM figure: the Host RAM card is the one that counts.
+    const mem = g.unified_memory
+      ? 'unified memory (see Host RAM)'
+      : `${fmtBytes(g.memory_used_mb * 1048576)} / ${fmtBytes(g.memory_total_mb * 1048576)}`;
     return `<div class="gpu-card">
       <div class="gpu-name"><span>GPU ${g.index} · ${esc(g.name)}</span><span>sm_${g.compute_cap.replace('.', '')}</span></div>
       <div class="bar"><span style="width:${pct}%"></span></div>
-      <div class="gpu-meta">${fmtBytes(g.memory_used_mb * 1048576)} / ${fmtBytes(g.memory_total_mb * 1048576)} · ${g.utilization}% · ${g.temperature}°C</div>
+      <div class="gpu-meta">${mem} · ${g.utilization}% · ${g.temperature}°C</div>
     </div>`;
   }).join('') + ramCard(ram);
 }
