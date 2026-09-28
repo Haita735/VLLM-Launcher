@@ -1020,6 +1020,7 @@ function init() {
           repo: $('dl-repo').value.trim(),
           revision: $('dl-revision').value.trim(),
           include: $('dl-include').value.trim(),
+          endpoint: $('dl-endpoint').value.trim(),
         }),
       }));
     } catch (err) { alert(err.message); }

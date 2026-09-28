@@ -312,6 +312,9 @@
           <label>Revision<input id="dl-revision" placeholder="main" /></label>
           <label>Include patterns (optional)<input id="dl-include" placeholder='*.safetensors *.json' /></label>
         </div>
+        <label class="wide-plain">Mirror endpoint (optional)
+          <input id="dl-endpoint" placeholder="https://huggingface.co   (e.g. https://hf-mirror.com when HF throttles)" />
+        </label>
         <div class="actions">
           <button class="primary" id="dl-start">Download</button>
           <button class="danger" id="dl-cancel" disabled>Cancel</button>

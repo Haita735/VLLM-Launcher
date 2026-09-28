@@ -2237,6 +2237,13 @@ def parse_repo_id(value: str) -> str:
     return value
 
 
+MAX_DOWNLOAD_RETRIES = int(os.environ.get("VLLM_LAUNCHER_DOWNLOAD_RETRIES", "5"))
+# If on-disk progress makes no move for this long, the connection is dead/throttled and
+# per-file retries alone won't recover it in time: force a respawn that byte-resumes.
+STALL_TIMEOUT = int(os.environ.get("VLLM_LAUNCHER_DOWNLOAD_STALL_S", "240"))
+ENDPOINT_RE = re.compile(r"^https?://[A-Za-z0-9.-]+(?::\d{1,5})?(/[\S]*)?$")
+
+
 @dataclass
 class Downloader:
     log: EventLog = field(default_factory=lambda: EventLog(2000))
@@ -2247,80 +2254,162 @@ class Downloader:
     started_at: float | None = None
     finished: bool = False
     returncode: int | None = None
+    attempt: int = 0
+    cancelled: bool = False
+    include: str | None = None
+    endpoint: str | None = None
+    _retry_deadline: float | None = field(default=None, repr=False)
     _trees: dict[tuple[str, str], tuple[float, dict[str, int] | None]] = field(default_factory=dict, repr=False)
     _samples: deque = field(default_factory=lambda: deque(maxlen=64), repr=False)
 
-    def start(self, repo: str, revision: str | None, include: str | None) -> dict:
+    def _spawn(self, repo: str, revision: str | None, include: str | None, endpoint: str | None = None) -> subprocess.Popen:
+        argv = [*_hf_cli(), "download", repo]
+        if revision:
+            argv += ["--revision", revision]
+        if include:
+            for pattern in shlex.split(include):
+                argv += ["--include", pattern]
+
+        env = os.environ.copy()
+        env.setdefault("HF_HOME", HF_HOME)
+        env["HF_HUB_OFFLINE"] = "0"  # the launcher defaults to offline; downloads need the network
+        # HF's Xet CAS backend intermittently fails with fatal "416 Range Not Satisfiable"
+        # get_reconstruction errors; the classic HTTP path retries and resumes from
+        # partial shards, so prefer it (override with HF_HUB_DISABLE_XET=0 in the env).
+        env.setdefault("HF_HUB_DISABLE_XET", "1")
+        env["PYTHONUNBUFFERED"] = "1"
+        if endpoint:
+            env["HF_ENDPOINT"] = endpoint
+
+        self.log.append(f"$ {shlex.join(argv)}" + (f"   (endpoint {endpoint})" if endpoint else ""))
+        try:
+            return subprocess.Popen(
+                argv,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            self.log.append(f"Failed to start download: {exc}")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    def start(self, repo: str, revision: str | None, include: str | None, endpoint: str | None = None) -> dict:
         with self.lock:
             if self.process and self.process.poll() is None:
                 raise HTTPException(status_code=409, detail="A download is already running")
 
-            argv = [*_hf_cli(), "download", repo]
-            if revision:
-                if not HF_REVISION_RE.match(revision):
-                    raise HTTPException(status_code=400, detail="Invalid revision")
-                argv += ["--revision", revision]
-            if include:
-                for pattern in shlex.split(include):
-                    argv += ["--include", pattern]
-
-            env = os.environ.copy()
-            env.setdefault("HF_HOME", HF_HOME)
-            env["HF_HUB_OFFLINE"] = "0"  # the launcher defaults to offline; downloads need the network
-            # HF's Xet CAS backend intermittently fails with fatal "416 Range Not Satisfiable"
-            # get_reconstruction errors; the classic HTTP path retries and resumes from
-            # partial shards, so prefer it (override with HF_HUB_DISABLE_XET=0 in the env).
-            env.setdefault("HF_HUB_DISABLE_XET", "1")
-            env["PYTHONUNBUFFERED"] = "1"
+            if revision and not HF_REVISION_RE.match(revision):
+                raise HTTPException(status_code=400, detail="Invalid revision")
+            if endpoint and not ENDPOINT_RE.match(endpoint):
+                raise HTTPException(status_code=400, detail="Invalid endpoint URL")
+            if endpoint:
+                endpoint = endpoint.rstrip("/")
 
             self.revision = (revision or "main").strip()
             self._samples.clear()
             self.log.clear()
-            self.log.append(f"$ {shlex.join(argv)}")
-            self.log.append(f"HF_HOME={env['HF_HOME']}")
-            try:
-                process = subprocess.Popen(
-                    argv,
-                    env=env,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    start_new_session=True,
-                )
-            except OSError as exc:
-                self.log.append(f"Failed to start download: {exc}")
-                raise HTTPException(status_code=500, detail=str(exc)) from exc
+            self.log.append(f"HF_HOME={os.environ.get('HF_HOME') or HF_HOME}")
+            if endpoint:
+                self.log.append(f"Using endpoint {endpoint} (progress total still comes from huggingface.co).")
+            process = self._spawn(repo, revision, include, endpoint)
 
             self.process = process
             self.repo = repo
+            self.include = include
+            self.endpoint = endpoint
             self.started_at = time.time()
             self.finished = False
             self.returncode = None
+            self.attempt = 0
+            self.cancelled = False
 
         threading.Thread(target=self._pump, args=(process,), daemon=True).start()
         return self.status()
 
+    def _disk_bytes(self, repo: str) -> int:
+        d = hf_home() / "hub" / _cache_dir(repo) / "blobs"
+        if not d.exists():
+            return 0
+        return sum(p.stat().st_size for p in d.iterdir() if p.is_file())
+
     def _pump(self, process: subprocess.Popen):
-        try:
-            if process.stdout:
-                for line in process.stdout:
-                    self.log.append(line)
-        finally:
-            code = process.wait()
+        # A 100+ GB download over a home line WILL get a connection break at some
+        # point (ChunkedEncodingError/IncompleteRead aborts the whole `hf download`
+        # run with exit 1), and the CDN edge can also go fully flat (read-timeout
+        # churn, zero bytes moving). Partial shards survive on disk and every run
+        # resumes them byte-exactly, so both failure shapes are handled the same
+        # way: respawning the run. Exits are retried with backoff until the run
+        # succeeds, is cancelled, or the attempt budget runs out; a run that shows
+        # no on-disk movement for STALL_TIMEOUT seconds is force-killed mid-churn
+        # instead of waiting for the fatal.
+        repo, revision, include, endpoint = self.repo, (self.revision or "main").strip() or None, self.include, self.endpoint
+        repo = repo or ""
+        while True:
+            last_progress = self._disk_bytes(repo) if repo else 0
+            last_moved = time.monotonic()
+            try:
+                if process.stdout:
+                    for line in process.stdout:
+                        self.log.append(line)
+                        # The CLI never prints per-byte updates through a pipe, so the
+                        # disk is the only signal of real progress during a stalled run.
+                        now = time.monotonic()
+                        if STALL_TIMEOUT and now - last_moved > STALL_TIMEOUT:
+                            have = self._disk_bytes(repo)
+                            if have > last_progress:
+                                last_progress, last_moved = have, now
+                                self.log.append(f"Progress resumed at {have // (1024**3)} GiB on disk.")
+                            else:
+                                self.log.append(f"No on-disk progress for >{STALL_TIMEOUT}s; force-restarting the run (byte-resumes from partials)...")
+                                _kill_group(process, signal.SIGKILL)
+                                break
+            finally:
+                code = process.wait()
             with self.lock:
-                self.finished = True
-                self.returncode = code
-            self.log.append(f"Download finished with code {code}")
-            if code == 0:
-                discover_models(force=True)
-                self.log.append("Model list refreshed.")
+                if self.cancelled or code == 0 or self.attempt >= MAX_DOWNLOAD_RETRIES:
+                    self.finished = True
+                    self.returncode = code
+                else:
+                    self.attempt += 1
+                    code = None  # sentinel: keep looping
+            if code is not None:
+                self.log.append(f"Download finished with code {code}")
+                if code == 0:
+                    discover_models(force=True)
+                    self.log.append("Model list refreshed.")
+                return
+            delay = min(10 * self.attempt, 60)
+            self.log.append(f"Download failed (exit {process.returncode}); retry {self.attempt}/{MAX_DOWNLOAD_RETRIES} in {delay}s (resumes from partial files)...")
+            self._retry_deadline = time.monotonic() + delay
+            time.sleep(delay)
+            self._retry_deadline = None
+            if self.cancelled:
+                with self.lock:
+                    self.finished = True
+                    self.returncode = process.returncode
+                return
+            try:
+                process = self._spawn(repo, revision, include, endpoint)
+            except HTTPException:
+                with self.lock:
+                    self.finished = True
+                    self.returncode = -1
+                self.log.append("Giving up: could not restart the download.")
+                return
+            with self.lock:
+                self.process = process
 
     def cancel(self) -> dict:
         with self.lock:
             process = self.process
+            # Set the flag before anything else: the retry loop checks it, and the
+            # process may already be dead during a backoff sleep between attempts.
+            self.cancelled = True
         if not process or process.poll() is not None:
             self.log.append("No download is running.")
             return self.status()
@@ -2371,12 +2460,18 @@ class Downloader:
         with self.lock:
             process = self.process
             running = bool(process and process.poll() is None)
+            # During a retry backoff the child is momentarily dead; report as running
+            # so the UI keeps showing the in-progress state instead of flickering to idle.
+            if not running and self._retry_deadline and time.monotonic() < self._retry_deadline:
+                running = True
             repo, revision = self.repo, self.revision
+            attempt = self.attempt
             status = {
                 "running": running,
                 "repo": self.repo,
                 "pid": process.pid if process else None,
                 "returncode": self.returncode,
+                "attempt": attempt,
                 "elapsed": time.time() - self.started_at if self.started_at else None,
             }
         # Progress is derived from the on-disk blobs, not the CLI output (the
@@ -2444,7 +2539,10 @@ downloader = Downloader()
 @app.post("/api/download")
 def api_download(body: dict):
     repo = parse_repo_id(body.get("repo", ""))
-    return downloader.start(repo, body.get("revision") or None, body.get("include") or None)
+    # Optional mirror endpoint (HF_ENDPOINT): the CDN edge that serves huggingface.co
+    # can throttle a large long download; content hashes are the same on a mirror, so
+    # hf download keeps resuming the exact partial blobs over the mirror instead.
+    return downloader.start(repo, body.get("revision") or None, body.get("include") or None, str(body.get("endpoint") or "").strip() or None)
 
 
 @app.post("/api/download/cancel")
