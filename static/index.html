@@ -295,6 +295,14 @@
         <h2>Download from Hugging Face</h2>
         <div class="head-actions"><span id="dl-status" class="muted-text">idle</span></div>
       </div>
+      <div class="dl-progress" id="dl-progress" hidden>
+        <div class="dl-progress-head">
+          <span id="dl-progress-label">…</span>
+          <span class="muted-text" id="dl-progress-eta"></span>
+        </div>
+        <div class="dl-bar track"><div class="dl-bar fill" id="dl-progress-fill" style="width:0%"></div></div>
+        <div class="muted-text" id="dl-progress-detail"></div>
+      </div>
       <div class="config-body">
         <label class="wide-plain">Model URL or repo id
           <input id="dl-repo" placeholder="https://huggingface.co/<org>/<model>  or  <org>/<model>" />

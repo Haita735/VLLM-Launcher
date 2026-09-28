@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from collections import deque
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
@@ -1988,7 +1989,7 @@ class Runtime:
                 if previous is not None:
                     self._note_locked(
                         f"kernel JIT finished: {previous['op']} "
-                        f"({previous['done']}/{previous['total']} steps, {_fmt_duration(previous['elapsed_s'])}); "
+                        f"({previous['done']}/{previous['total']} steps, {_fmt_duration(previous['elapsed_s'])}; "
                         "cached for later starts."
                     )
                 return
@@ -2242,9 +2243,12 @@ class Downloader:
     lock: threading.Lock = field(default_factory=threading.Lock)
     process: subprocess.Popen | None = None
     repo: str | None = None
+    revision: str | None = None
     started_at: float | None = None
     finished: bool = False
     returncode: int | None = None
+    _trees: dict[tuple[str, str], tuple[float, dict[str, int] | None]] = field(default_factory=dict, repr=False)
+    _samples: deque = field(default_factory=lambda: deque(maxlen=64), repr=False)
 
     def start(self, repo: str, revision: str | None, include: str | None) -> dict:
         with self.lock:
@@ -2263,8 +2267,14 @@ class Downloader:
             env = os.environ.copy()
             env.setdefault("HF_HOME", HF_HOME)
             env["HF_HUB_OFFLINE"] = "0"  # the launcher defaults to offline; downloads need the network
+            # HF's Xet CAS backend intermittently fails with fatal "416 Range Not Satisfiable"
+            # get_reconstruction errors; the classic HTTP path retries and resumes from
+            # partial shards, so prefer it (override with HF_HUB_DISABLE_XET=0 in the env).
+            env.setdefault("HF_HUB_DISABLE_XET", "1")
             env["PYTHONUNBUFFERED"] = "1"
 
+            self.revision = (revision or "main").strip()
+            self._samples.clear()
             self.log.clear()
             self.log.append(f"$ {shlex.join(argv)}")
             self.log.append(f"HF_HOME={env['HF_HOME']}")
@@ -2315,6 +2325,7 @@ class Downloader:
             self.log.append("No download is running.")
             return self.status()
         self.log.append("Cancelling download...")
+        self._samples.clear()
         _kill_group(process, signal.SIGTERM)
         try:
             process.wait(timeout=15)
@@ -2322,17 +2333,109 @@ class Downloader:
             _kill_group(process, signal.SIGKILL)
         return self.status()
 
+    def _tree_sizes(self, repo: str, revision: str | None) -> dict[str, int] | None:
+        """Map every repo file's blob OID (== the HF cache blob filename) to its size,
+        from the revision's tree. The total of these sizes is the download's denominator;
+        cached for 10 minutes so the 3-second UI polls cost nothing."""
+        if not repo:
+            return None
+        key = (repo, revision or "main")
+        now = time.monotonic()
+        cached = self._trees.get(key)
+        if cached and now - cached[0] < 600:
+            return cached[1]
+        sizes: dict[str, int] | None = None
+        try:
+            url = f"https://huggingface.co/api/models/{repo}/tree/{quote(revision or 'main', safe='/')}?recursive=true"
+            response = httpx.get(url, timeout=15, follow_redirects=True, headers={"Accept": "application/json"})
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                # The HF cache names each blob after the file's 64-char content hash:
+                # that is `lfs.oid` for LFS (large) files and the git `oid` for small
+                # non-LFS files. The `oid` alone is the *pointer*'s git blob SHA for
+                # LFS files and does not match the on-disk name.
+                def disk_key(item):
+                    return (item.get("lfs") or {}).get("oid") or item.get("oid")
+                sizes = {
+                    disk_key(item): int(item.get("size") or 0)
+                    for item in data
+                    if item.get("type") == "file" and disk_key(item)
+                }
+        except Exception:
+            sizes = None
+        self._trees[key] = (now, sizes)
+        return sizes
+
     def status(self) -> dict:
         with self.lock:
             process = self.process
             running = bool(process and process.poll() is None)
-            return {
+            repo, revision = self.repo, self.revision
+            status = {
                 "running": running,
                 "repo": self.repo,
                 "pid": process.pid if process else None,
                 "returncode": self.returncode,
                 "elapsed": time.time() - self.started_at if self.started_at else None,
             }
+        # Progress is derived from the on-disk blobs, not the CLI output (the
+        # progress bar never renders through a pipe). HF names each cached blob
+        # after the file's 64-char content hash (lfs.oid for large files) — the
+        # same key _tree_sizes reports — so per-file bytes on disk map
+        # one-to-one onto the tree sizes. The tree fetch is outside the lock: it can take seconds, and `start`/
+        # `cancel` must not hold them hostage while it runs.
+        if repo:
+            sizes = self._tree_sizes(repo, revision)
+            blobs_dir = hf_home() / "hub" / _cache_dir(repo) / "blobs"
+        else:
+            sizes, blobs_dir = None, None
+        if sizes and blobs_dir is not None and blobs_dir.exists():
+            total = sum(sizes.values())
+            files = []
+            done = 0
+            for oid, size in sizes.items():
+                complete = blobs_dir / oid
+                path = complete if complete.exists() else blobs_dir / f"{oid}.incomplete"
+                have = 0
+                if path.exists():
+                    have = size if path is complete else min(path.stat().st_size, size)
+                done += have
+                files.append({
+                    "oid": oid,
+                    "size": size,
+                    "done": have,
+                    "state": "done" if path is complete else ("active" if path.exists() else "pending"),
+                })
+            done = min(done, total)
+            status["progress"] = {"total": total, "done": done, "files": files}
+            # Rate over the last ~60 s of samples: a single stalled or resumed
+            # request must not yank the ETA. (deque ops are thread-safe.)
+            now = time.monotonic()
+            self._samples.append((now, done))
+            while self._samples and now - self._samples[0][0] > 60:
+                self._samples.popleft()
+            if len(self._samples) >= 2:
+                (t0, d0), (t1, d1) = self._samples[0], self._samples[-1]
+                if t1 > t0 and d1 > d0:
+                    rate = (d1 - d0) / (t1 - t0)
+                    status["progress"]["rate"] = rate
+                    status["progress"]["eta"] = (total - d1) / rate
+        elif blobs_dir is not None and blobs_dir.exists() and not sizes:
+            # Tree API unreachable (offline): a raw byte count keeps the bar honest
+            # without a percentage; the UI hides the % when total is 0.
+            raw = sum(p.stat().st_size for p in blobs_dir.iterdir() if p.is_file())
+            status["progress"] = {"total": 0, "done": raw, "files": []}
+        return status
+
+
+def _cache_dir(repo: str) -> str:
+    """The HF cache directory name for a repo id: models--org--name (slashes -> dashes)."""
+    return "models--" + repo.replace("/", "--")
+
+
+def hf_home() -> Path:
+    return Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface")
 
 
 downloader = Downloader()

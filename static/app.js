@@ -597,12 +597,55 @@ async function resolveRepo() {
   }
 }
 
+function fmtDur(s) {
+  if (!Number.isFinite(s) || s <= 0) return '—';
+  s = Math.round(s);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+}
+
+function renderDownloadProgress(status) {
+  const wrap = $('dl-progress');
+  const p = status.progress;
+  // Show the bar while a download is running or has finished successfully; otherwise idle.
+  const show = status.running || (status.repo !== null && status.returncode === 0 && p);
+  wrap.hidden = !show;
+  if (!show || !p) return;
+
+  const total = p.total || 0, done = p.done || 0;
+  const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+  const fill = $('dl-progress-fill');
+  const label = $('dl-progress-label'), detail = $('dl-progress-detail'), eta = $('dl-progress-eta');
+
+  if (status.running) {
+    const rate = p.rate || 0;
+    label.textContent = total > 0 ? `${pct.toFixed(1)}% · ${fmtBytes(done)} / ${fmtBytes(total)}` : `downloading… ${fmtBytes(done)}`;
+    eta.textContent = [
+      p.eta ? `ETA ${fmtDur(p.eta)}` : null,
+      rate > 0 ? `${(rate / 1048576).toFixed(1)} MiB/s` : null,
+    ].filter(Boolean).join(' · ');
+    fill.classList.toggle('indeterminate', total === 0);
+    fill.style.width = `${pct}%`;
+    const act = (p.files || []).filter((f) => f.state === 'active').length;
+    detail.textContent = p.files?.length ? `${(p.files || []).filter((f) => f.state === 'done').length}/${p.files.length} files, ${act} in flight` : `elapsed ${Math.round(status.elapsed || 0)}s`;
+  } else {
+    label.textContent = `complete · ${fmtBytes(done)}${total ? ` (${fmtBytes(total)})` : ''}`;
+    eta.textContent = status.repo ? `finish ${new Date().toLocaleTimeString()}` : '';
+    fill.classList.remove('indeterminate');
+    fill.style.width = '100%';
+    detail.textContent = '';
+  }
+}
+
 function setDownloadStatus(status) {
   $('dl-status').textContent = status.running
     ? `downloading ${status.repo}… ${Math.round(status.elapsed || 0)}s`
     : (status.repo ? `${status.repo} — exit ${status.returncode}` : 'idle');
   $('dl-start').disabled = status.running;
   $('dl-cancel').disabled = !status.running;
+  renderDownloadProgress(status);
 }
 
 let dlRenderQueued = false;
