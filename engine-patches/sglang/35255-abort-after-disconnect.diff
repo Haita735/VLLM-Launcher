@@ -2,7 +2,8 @@ Abort a request when its client disconnects after it reached the scheduler.
 
 Backport of upstream sglang f478b2bb2d, "Fix: abort handling for dispatched
 requests after client disconnect" (sgl-project/sglang#35255, 2026-09-04), to
-builds from before it (tested on 0.0.0.dev1+gd91c3682b, 2026-08-16).
+builds from before it (tested on 0.0.0.dev1+gd91c3682b, 2026-08-16, and on the
+qwen4-main-squashed branch at 4ccff141db, 2026-09-07, which is the DGX Spark build).
 
 Without it, a streaming client that disconnects mid-answer (Stop, a timeout, a
 restart) has its request state deleted, so every later abort for it is ignored
