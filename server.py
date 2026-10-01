@@ -287,6 +287,14 @@ RAM_KILL_GIB = _env_float("VLLM_LAUNCHER_RAM_KILL_GIB", 2.0)
 # backstop. VLLM_LAUNCHER_RAM_PSI_FULL overrides either; see ram_psi_full_kill().
 RAM_PSI_FULL_KILL_DISCRETE = 25.0
 RAM_PSI_FULL_KILL_UNIFIED = 80.0
+# Decode watchdog (SGLang with speculative decoding). A request whose output has gone bad - the
+# model's scores turn NaN and it writes "!!!!" (token 0) - gets every draft token rejected, so the
+# batch's accept rate sits at exactly 0.00; healthy text never does for long, and the rate is the
+# batch average, so 0.00 means every running request is broken. After this many decode log lines
+# in a row (~40 steps each) the watchdog aborts them and flushes SGLang's prefix cache, which
+# would otherwise hand the broken state to the next request on the same conversation. 0 = off.
+DECODE_STUCK_LINES = int(_env_float("VLLM_LAUNCHER_DECODE_STUCK_LINES", 4))
+_DECODE_STATS_RE = re.compile(r"Decode batch, #running-req: (\d+),.*?accept rate: ([0-9.]+)")
 JIT_RAM_PER_JOB_GIB = _env_float("VLLM_LAUNCHER_JIT_RAM_PER_JOB_GIB", 6.0)
 # Measured: SGLang's scheduler + tokenizer + detokenizer sit at ~6 GiB of anonymous memory
 # while a model loads; vLLM's engine core is similar. The JIT budget is what is left after that.
@@ -1734,6 +1742,7 @@ class Runtime:
     _max_jobs: int = 1
     _jit: dict | None = None  # current kernel JIT build, for /api/status and the log
     _external_engines: dict = field(default_factory=dict)  # port -> detected engine of an adopted server
+    _stuck_decodes: int = 0  # decode log lines in a row at accept rate 0.00 (see DECODE_STUCK_LINES)
 
     def __post_init__(self):
         self.condition = threading.Condition(self.lock)
@@ -1887,6 +1896,8 @@ class Runtime:
                     with self.lock:
                         if process is self.process:
                             self._append_locked(line)
+                    if DECODE_STUCK_LINES and (m := _DECODE_STATS_RE.search(line)):
+                        self._decode_watchdog(process, int(m[1]), float(m[2]))
         finally:
             code = process.wait()
             with self.lock:
@@ -1919,6 +1930,40 @@ class Runtime:
                 "worker - the traceback above is the actual cause."
             )
         return "not the launcher; killed externally or by the kernel (check `journalctl -k`)."
+
+    def _decode_watchdog(self, process: subprocess.Popen, running: int, accept_rate: float) -> None:
+        """Abort requests stuck writing garbage and flush SGLang's cache (see DECODE_STUCK_LINES).
+        Clients don't always notice: an agent retries into the cached broken state, and a client
+        that just disconnects leaves an unpatched SGLang generating to max_tokens."""
+        self._stuck_decodes = self._stuck_decodes + 1 if running and accept_rate == 0.0 else 0
+        if self._stuck_decodes < DECODE_STUCK_LINES:
+            return
+        self._stuck_decodes = 0
+        with self.lock:
+            if process is not self.process or not self.spec or self.spec.engine != "sglang":
+                return
+            port, key = self.spec.port, self.spec.api_key
+            self._note_locked(
+                f"DECODE WATCHDOG: speculative accept rate 0.00 for {DECODE_STUCK_LINES} decode logs in a row "
+                f"with {running} request(s) running - their output has gone bad (NaN, e.g. '!!!!'). "
+                "Aborting them and flushing the prefix cache so nothing reuses the broken state."
+            )
+        threading.Thread(target=self._abort_and_flush, args=(process, port, key), daemon=True).start()
+
+    def _abort_and_flush(self, process: subprocess.Popen, port: int, api_key: str | None) -> None:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        base = f"http://127.0.0.1:{port}"
+        try:
+            with httpx.Client(timeout=15, headers=headers) as client:
+                client.post(f"{base}/abort_request", json={"abort_all": True})
+                # waits up to 10 s for the aborted requests to drain; a new one arriving can block it
+                r = client.post(f"{base}/flush_cache", params={"timeout": 10})
+                result = "cache flushed" if r.is_success else f"cache not flushed ({r.text.strip()[:120]})"
+        except httpx.HTTPError as exc:
+            result = f"could not reach the server: {exc}"
+        with self.lock:
+            if process is self.process:
+                self._note_locked(f"DECODE WATCHDOG: {result}")
 
     def _ram_watchdog(self, process: subprocess.Popen, engine: str):
         """Kill the engine's whole process group before host RAM runs out. SIGKILL rather than
