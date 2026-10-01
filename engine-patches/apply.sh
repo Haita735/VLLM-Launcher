@@ -7,7 +7,8 @@
 #
 # The engine's Python is $SGLANG_PYTHON / $VLLM_PYTHON, else the conda env named after the
 # engine (the same names the launcher looks for). Each patch is a backport of an upstream fix,
-# so a newer engine already has it: a patch that doesn't fit is reported, never forced.
+# so a newer engine already has it: a patch's "Upstream-marker: <file> <text>" header line names
+# code that only builds with the fix contain. A patch that doesn't fit is reported, never forced.
 # Reinstalling or upgrading the engine undoes these; run this again afterwards, then restart
 # the model so it loads the patched code.
 set -euo pipefail
@@ -45,8 +46,11 @@ for diff in "$HERE/$ENGINE"/*.diff; do
       --check) echo "  missing   $name"; status=1 ;;
       --revert) echo "  not in    $name" ;;
     esac
+  elif marker=$(sed -n 's/^Upstream-marker: //p' "$diff") && [[ -n $marker ]] \
+       && grep -qF -- "${marker#* }" "$SITE/${marker%% *}" 2>/dev/null; then
+    echo "  upstream  $name: this build has the fix already"
   else
-    echo "  no fit    $name: this build differs from the one it was made for (a newer one may have the fix already); see the note at the top of it"
+    echo "  no fit    $name: this build differs from the one it was made for; see the note at the top of it"
     [[ $MODE == --revert ]] || status=1
   fi
 done

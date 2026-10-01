@@ -13,6 +13,8 @@ taken by an answer nobody reads.
 Apply with engine-patches/apply.sh. Not needed on sglang builds that include
 the upstream fix; apply.sh detects that and skips.
 
+Upstream-marker: sglang/srt/managers/tokenizer_manager.py abort_sent: bool
+
 diff -ru a/sglang/srt/managers/scheduler.py b/sglang/srt/managers/scheduler.py
 --- a/sglang/srt/managers/scheduler.py
 +++ b/sglang/srt/managers/scheduler.py
