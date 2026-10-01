@@ -174,13 +174,6 @@ If you use `venv` instead, the launcher also checks `~/vllm/.venv`, `~/vllm-env`
 same for `sglang`). Anything else: set `VLLM_PYTHON` / `SGLANG_PYTHON` (see
 [Configuration reference](#configuration-reference)).
 
-Then apply the [engine patches](#engine-patches) — fixes from upstream that your engine build may
-predate:
-
-```bash
-~/VLLM-Launcher/engine-patches/apply.sh sglang
-```
-
 ### 5. Get the launcher
 
 ```bash
@@ -296,9 +289,6 @@ cd ~/VLLM-Launcher && git pull
 systemctl --user restart vllm-launcher    # or: sudo systemctl restart vllm-launcher
 ```
 
-After upgrading or reinstalling an engine, run `engine-patches/apply.sh <engine>` again: pip
-replaces the patched files. See [Engine patches](#engine-patches).
-
 Saved profiles and presets live in `profiles/` and `presets/` (gitignored) and are kept.
 Run logs and JIT linker shims live under `~/.cache/vllm-launcher/`; deleting that directory is
 always safe.
@@ -392,7 +382,6 @@ All optional. Set them in the shell, the systemd unit, or its `EnvironmentFile`.
 | `VLLM_LAUNCHER_MIN_FREE_RAM_GIB` | `4` | refuse to launch below this much free host RAM |
 | `VLLM_LAUNCHER_RAM_KILL_GIB` | `2` | watchdog kills the engine below this |
 | `VLLM_LAUNCHER_RAM_PSI_FULL` | `25` (`80` on unified memory) | … or when memory PSI `full avg10` exceeds this % |
-| `VLLM_LAUNCHER_DECODE_STUCK_LINES` | `4` | SGLang decode logs in a row at speculative accept rate 0.00 before the [decode watchdog](#decode-watchdog-sglang) acts; `0` = off |
 | `VLLM_LAUNCHER_JIT_RAM_PER_JOB_GIB` | `6` | RAM budgeted per parallel `nvcc` job |
 | `VLLM_LAUNCHER_ENGINE_RAM_RESERVE_GIB` | `6` | RAM reserved for the engine's own processes before sizing JIT |
 | `VLLM_LAUNCHER_JIT_MAX_JOBS` | `4` | hard cap on the derived `MAX_JOBS` |
@@ -506,32 +495,6 @@ The header's RAM card turns red when a launch would be refused, and the launch n
 largest other RAM users on the box. Exit `-9` is diagnosed: watchdog kill, a kernel OOM kill
 inside the cgroup (counted from `memory.events`), Stop, or — for SGLang — the engine killing its
 own tree after a worker exception, in which case the real error is above in the log.
-
-### Decode watchdog (SGLang)
-
-The failure this catches: with speculative decoding on, a request's output goes bad — its
-scores turn NaN and it writes `!!!!` (token 0) without end. Every draft token is then rejected,
-so SGLang's `Decode batch` log shows `accept rate: 0.00`. Healthy text never stays there, and the
-rate is the batch average, so 0.00 means every running request is broken.
-
-After `VLLM_LAUNCHER_DECODE_STUCK_LINES` such log lines in a row (~40 decode steps each) the
-launcher calls SGLang's `/abort_request` for all requests, then `/flush_cache`, so a retry on the
-same conversation does not pick the broken state back up from the prefix cache. Both steps are
-written to the log as `DECODE WATCHDOG: ...`. This contains the damage; it does not fix the
-cause, which is in the engine.
-
-### Engine patches
-
-`engine-patches/<engine>/*.diff` are backports of upstream fixes, applied to the installed engine
-by `engine-patches/apply.sh <engine>` (`--check` to report, `--revert` to take them out). Each
-names the upstream change it comes from. A build that already has a fix reports it as `no fit`
-and is left alone; once every installed engine has the fixes, the patches can go. pip replaces
-patched files on upgrade or reinstall, so run the script again after either, then restart the
-model.
-
-| Patch | Upstream | Fixes |
-|---|---|---|
-| `sglang/35255-abort-after-disconnect.diff` | sgl-project/sglang#35255 (f478b2bb2d) | A client that disconnects mid-answer (Stop, a timeout, a restart) leaves the request decoding to `max_tokens`, holding a slot and its KV cache. |
 
 ### JIT progress
 
